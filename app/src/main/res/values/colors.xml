@@ -1,0 +1,24 @@
+<resources>
+    <!-- 纯白：仅用于图标底色等与主题无关的地方 -->
+    <color name="white">#FFFFFFFF</color>
+
+    <!-- 主题色：深色模式在 values-night/colors.xml 里成对覆盖 -->
+    <color name="bg">#FFFFFFFF</color>
+    <color name="on_accent">#FFFFFFFF</color>
+    <color name="text_primary">#FF1A1A1A</color>
+    <color name="text_secondary">#FF8A8A8A</color>
+    <color name="divider">#FFEAEAEA</color>
+    <color name="chip_bg">#FFF2F2F2</color>
+    <color name="accent">#FF111111</color>
+
+    <!-- 词级标记 -->
+    <color name="mark_cet6">#FFD93636</color>
+    <color name="mark_high">#FFC77A00</color>
+
+    <!-- 柔和按钮：90% 不透明的表面色，配相册背景时能透出一点底色 -->
+    <color name="btn_fill">#E6F5F5F3</color>
+    <color name="btn_stroke">#FFE2E2DF</color>
+    <color name="btn_ripple">#1A000000</color>
+
+    <color name="ic_launcher_background">#FFFFFFFF</color>
+</resources>

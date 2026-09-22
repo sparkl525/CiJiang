@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "updated": "2026-09-22",
+  "baseUrl": "https://cdn.jsdelivr.net/gh/sparkl525/-v2.0@main",
+  "note": "简译 App 听力素材清单。builtin=true 的已内置在 APK，其余由「素材包」开关联网下载到手机。",
+  "items": [
+    {
+      "id": "l-001",
+      "title": "Lincoln's Cottage: a Country House for the President",
+      "titleZh": "林肯的小屋",
+      "topic": "VOA 慢速英语",
+      "level": "easy",
+      "words": 377,
+      "sentences": 61,
+      "durationSec": 217,
+      "builtin": true,
+      "hasAudio": true,
+      "audioBytes": 3446535,
+      "text": "articles/l-001.lrc",
+      "audio": "audio/l-001.mp3",
+      "source": "21voa.com（VOA Learning English 存量，站点已停更）"
+    },
+    {
+      "id": "l-002",
+      "title": "The Goodyear Blimp Has Been Flying Over America for 100 Years",
+      "titleZh": "固特异飞艇飞了 100 年",
+      "topic": "VOA 慢速英语",
+      "level": "easy",
+      "words": 509,
+      "sentences": 92,
+      "durationSec": 315,
+      "builtin": false,
+      "hasAudio": true,
+      "audioBytes": 2502365,
+      "text": "articles/l-002.lrc",
+      "audio": "audio/l-002.mp3",
+      "source": "21voa.com（VOA Learning English 存量，站点已停更）"
+    },
+    {
+      "id": "l-003",
+      "title": "The Golden Gate Bridge: San Francisco’s Historic Suspension Bridge",
+      "titleZh": "金门大桥",
+      "topic": "VOA 慢速英语",
+      "level": "easy",
+      "words": 336,
+      "sentences": 55,
+      "durationSec": 227,
+      "builtin": false,
+      "hasAudio": true,
+      "audioBytes": 3594911,
+      "text": "articles/l-003.lrc",
+      "audio": "audio/l-003.mp3",
+      "source": "21voa.com（VOA Learning English 存量，站点已停更）"
+    },
+    {
+      "id": "l-004",
+      "title": "American Culture: Bald Eagle Officially Named National Bird of U.S.",
+      "titleZh": "秃鹰成为美国国鸟",
+      "topic": "VOA 慢速英语",
+      "level": "easy",
+      "words": 643,
+      "sentences": 99,
+      "durationSec": 369,
+      "builtin": false,
+      "hasAudio": true,
+      "audioBytes": 2948955,
+      "text": "articles/l-004.lrc",
+      "audio": "audio/l-004.mp3",
+      "source": "21voa.com（VOA Learning English 存量，站点已停更）"
+    }
+  ]
+}

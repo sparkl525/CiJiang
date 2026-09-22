@@ -1,0 +1,11 @@
+<resources>
+    <string name="app_name">简译</string>
+    <string name="tab_dict">查词</string>
+    <string name="tab_translate">翻译</string>
+    <string name="tab_camera">拍照</string>
+    <string name="search_hint">输入单词或短语</string>
+    <string name="translate_hint">输入要翻译的句子或段落</string>
+    <string name="history">历史</string>
+    <string name="clear_history">清空</string>
+    <string name="back">← 返回</string>
+</resources>

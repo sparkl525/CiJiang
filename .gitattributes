@@ -1,0 +1,7 @@
+# 仓库内统一 LF，避免 Windows/macOS 协作时换行符来回抖动
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.mp3 binary
+*.dbz binary
+*.webp binary

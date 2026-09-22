@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "updated": "2026-09-22",
+  "baseUrl": "https://cdn.jsdelivr.net/gh/sparkl525/-v2.0@main",
+  "note": "简译 App 阅读素材清单。builtin=true 的已内置在 APK，其余由「素材包」开关联网下载到手机。",
+  "items": [
+    {
+      "id": "r-001",
+      "title": "Aesop I: Strength and Weakness",
+      "titleZh": "伊索寓言（一）· 强与弱",
+      "topic": "伊索寓言",
+      "level": "easy",
+      "words": 334,
+      "builtin": true,
+      "bytes": 2363,
+      "text": "articles/r-001.txt",
+      "translation": "articles/r-001.zh.txt",
+      "license": "public-domain"
+    },
+    {
+      "id": "r-002",
+      "title": "Aesop II: Together and Alone",
+      "titleZh": "伊索寓言（二）· 合与分",
+      "topic": "伊索寓言",
+      "level": "easy",
+      "words": 370,
+      "builtin": false,
+      "bytes": 2717,
+      "text": "articles/r-002.txt",
+      "translation": "articles/r-002.zh.txt",
+      "license": "public-domain"
+    },
+    {
+      "id": "r-003",
+      "title": "Aesop III: Hunger and Haste",
+      "titleZh": "伊索寓言（三）· 饿与急",
+      "topic": "伊索寓言",
+      "level": "easy",
+      "words": 283,
+      "builtin": false,
+      "bytes": 2010,
+      "text": "articles/r-003.txt",
+      "translation": "articles/r-003.zh.txt",
+      "license": "public-domain"
+    },
+    {
+      "id": "r-004",
+      "title": "Aesop IV: Boasting and Age",
+      "titleZh": "伊索寓言（四）· 夸与老",
+      "topic": "伊索寓言",
+      "level": "easy",
+      "words": 294,
+      "builtin": false,
+      "bytes": 2021,
+      "text": "articles/r-004.txt",
+      "translation": "articles/r-004.zh.txt",
+      "license": "public-domain"
+    }
+  ]
+}

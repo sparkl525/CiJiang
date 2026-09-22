@@ -1,0 +1,19 @@
+<resources>
+    <!-- 深色模式配色。只覆盖需要变的，白底图标等保持不变 -->
+    <color name="bg">#FF121212</color>
+    <color name="on_accent">#FF121212</color>
+    <color name="text_primary">#FFE9E9E9</color>
+    <color name="text_secondary">#FF9A9A9A</color>
+    <color name="divider">#FF2C2C2C</color>
+    <color name="chip_bg">#FF202020</color>
+    <color name="accent">#FFEDEDED</color>
+
+    <!-- 深底上提高亮度，保证可读 -->
+    <color name="mark_cet6">#FFFF6B6B</color>
+    <color name="mark_high">#FFFFC14D</color>
+
+    <!-- 柔和按钮（深色版） -->
+    <color name="btn_fill">#E6222224</color>
+    <color name="btn_stroke">#FF35353A</color>
+    <color name="btn_ripple">#26FFFFFF</color>
+</resources>

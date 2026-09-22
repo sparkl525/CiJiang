@@ -1,0 +1,23 @@
+# Gradle
+.gradle/
+app/build/
+build/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# 本机路径配置（每人不同，不入库）
+local.properties
+
+# 构建产物
+*.apk
+*.aab
+captures/
+.externalNativeBuild/
+.cxx/
+
+# 系统杂项
+.DS_Store
+Thumbs.db

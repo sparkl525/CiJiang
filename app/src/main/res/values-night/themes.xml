@@ -1,0 +1,10 @@
+<resources>
+    <!-- 深色主题：基底换成 Material 深色，状态栏图标改为浅色 -->
+    <style name="AppTheme" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/bg</item>
+        <item name="android:statusBarColor">@color/bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:navigationBarColor">@color/bg</item>
+        <item name="android:colorEdgeEffect">@color/divider</item>
+    </style>
+</resources>
