@@ -15,8 +15,8 @@ android {
         applicationId = "com.jianyi.dict"
         minSdk = 24
         targetSdk = 34
-        versionCode = 29
-        versionName = "2.0.6"
+        versionCode = 31
+        versionName = "2.0.8"
         // 只保留现代安卓手机的 64 位 ARM 架构，砍掉 x86 等无用架构（省 ~50MB）
         ndk { abiFilters.add("arm64-v8a") }
     }
