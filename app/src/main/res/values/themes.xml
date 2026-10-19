@@ -1,9 +1,19 @@
 <resources>
+    <!-- 页面转场：柔和淡入缩放，替掉系统默认的横滑 -->
+    <style name="AppWindowAnimation" parent="@android:style/Animation.Activity">
+        <item name="android:activityOpenEnterAnimation">@anim/activity_open_enter</item>
+        <item name="android:activityOpenExitAnimation">@anim/activity_open_exit</item>
+        <item name="android:activityCloseEnterAnimation">@anim/activity_close_enter</item>
+        <item name="android:activityCloseExitAnimation">@anim/activity_close_exit</item>
+    </style>
+
     <style name="AppTheme" parent="android:Theme.Material.Light.NoActionBar">
         <item name="android:windowBackground">@color/bg</item>
         <item name="android:statusBarColor">@color/bg</item>
         <item name="android:windowLightStatusBar">true</item>
         <item name="android:navigationBarColor">@color/bg</item>
         <item name="android:colorEdgeEffect">@color/divider</item>
+        <item name="android:windowAnimationStyle">@style/AppWindowAnimation</item>
+        <item name="android:colorAccent">@color/accent</item>
     </style>
 </resources>

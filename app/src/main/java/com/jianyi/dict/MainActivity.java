@@ -706,6 +706,7 @@ public class MainActivity extends Activity {
         TextView t = (TextView) tab;
         t.setTextColor(getColor(on ? R.color.text_primary : R.color.text_secondary));
         t.setTypeface(null, on ? Typeface.BOLD : Typeface.NORMAL);
+        t.setBackgroundResource(on ? R.drawable.tab_pill : 0);
     }
 
     // ================= 纵向手势：防误触版 =================
@@ -2509,9 +2510,9 @@ public class MainActivity extends Activity {
         t.setTextColor(getColor(colorRes));
         GradientDrawable bg = new GradientDrawable();
         bg.setColor(getColor(R.color.chip_bg));
-        bg.setCornerRadius(dp(9));
+        bg.setCornerRadius(dp(12));
         t.setBackground(bg);
-        t.setPadding(dp(8), dp(3), dp(8), dp(3));
+        t.setPadding(dp(10), dp(3), dp(10), dp(3));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         lp.setMarginEnd(dp(6));
@@ -3032,6 +3033,12 @@ public class MainActivity extends Activity {
             LinearLayout box = new LinearLayout(MainActivity.this);
             box.setOrientation(LinearLayout.VERTICAL);
             box.setPadding(dp(20), dp(14), dp(20), dp(14));
+            box.setBackgroundResource(R.drawable.btn_card);
+            LinearLayout.LayoutParams cardLp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            cardLp.topMargin = dp(pos == 0 ? 8 : 6);
+            cardLp.bottomMargin = dp(6);
+            box.setLayoutParams(cardLp);
 
             if (it.type == 2) {
                 TextView t = new TextView(MainActivity.this);

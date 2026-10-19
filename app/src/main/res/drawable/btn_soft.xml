@@ -1,22 +1,25 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 柔和按钮：半透明表面色 + 细描边 + 圆角，ripple 裁剪在圆角内 -->
+<!-- 柔和按钮：暖表面色 + 细描边 + 大圆角，ripple 裁剪在圆角内 -->
 <ripple xmlns:android="http://schemas.android.com/apk/res/android"
     android:color="@color/btn_ripple">
 
     <item android:id="@android:id/mask">
         <shape android:shape="rectangle">
             <solid android:color="@android:color/white" />
-            <corners android:radius="14dp" />
+            <corners android:radius="20dp" />
         </shape>
     </item>
 
     <item>
         <shape android:shape="rectangle">
-            <solid android:color="@color/btn_fill" />
+            <gradient
+                android:angle="270"
+                android:startColor="@color/btn_fill"
+                android:endColor="@color/surface_soft" />
             <stroke
                 android:width="1dp"
                 android:color="@color/btn_stroke" />
-            <corners android:radius="14dp" />
+            <corners android:radius="20dp" />
         </shape>
     </item>
 </ripple>

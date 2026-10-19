@@ -21,3 +21,6 @@ captures/
 # 系统杂项
 .DS_Store
 Thumbs.db
+
+# 构建/临时日志
+build_*.log
