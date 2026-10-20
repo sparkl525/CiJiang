@@ -660,5 +660,275 @@
                     android:background="@drawable/btn_card" />
             </LinearLayout>
         </LinearLayout>
+
+        <!-- ===== 单词本：查词页右下角圆形按钮进入，收藏的词；下滑返回 ===== -->
+        <LinearLayout
+            android:id="@+id/pageWordBook"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:orientation="vertical"
+            android:background="@color/bg"
+            android:clickable="true"
+            android:visibility="gone">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingStart="22dp"
+                android:paddingEnd="22dp"
+                android:paddingTop="16dp">
+
+                <TextView
+                    android:id="@+id/wbBack"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/back"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="15sp"
+                    android:paddingStart="10dp"
+                    android:paddingEnd="10dp"
+                    android:paddingTop="6dp"
+                    android:paddingBottom="6dp"
+                    android:background="@drawable/input_bg" />
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:gravity="end"
+                    android:text="单词本"
+                    android:textColor="@color/text_primary"
+                    android:textSize="18sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/wbCount"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:gravity="end"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="13sp" />
+            </LinearLayout>
+
+            <com.jianyi.dict.EdgeScrollView
+                android:id="@+id/wbScroll"
+                android:layout_width="match_parent"
+                android:layout_height="0dp"
+                android:layout_weight="1">
+
+                <LinearLayout
+                    android:id="@+id/wbBody"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:paddingStart="22dp"
+                    android:paddingEnd="22dp"
+                    android:paddingTop="16dp"
+                    android:paddingBottom="8dp" />
+            </com.jianyi.dict.EdgeScrollView>
+
+            <!-- 下滑退出把手：独立一条，浮在内容下面，不与滚动打架 -->
+            <com.jianyi.dict.DragHint
+                android:id="@+id/wbHint"
+                android:layout_width="152dp"
+                android:layout_height="40dp"
+                android:layout_gravity="center_horizontal"
+                android:layout_marginBottom="12dp" />
+        </LinearLayout>
+
+        <!-- ===== 错题集：记背页右下角圆形按钮进入，答错过的词；下滑返回 ===== -->
+        <LinearLayout
+            android:id="@+id/pageWrongBook"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:orientation="vertical"
+            android:background="@color/bg"
+            android:clickable="true"
+            android:visibility="gone">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingStart="22dp"
+                android:paddingEnd="22dp"
+                android:paddingTop="16dp">
+
+                <TextView
+                    android:id="@+id/wrongBack"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/back"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="15sp"
+                    android:paddingStart="10dp"
+                    android:paddingEnd="10dp"
+                    android:paddingTop="6dp"
+                    android:paddingBottom="6dp"
+                    android:background="@drawable/input_bg" />
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:gravity="end"
+                    android:text="错题集"
+                    android:textColor="@color/text_primary"
+                    android:textSize="18sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/wrongCount"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:gravity="end"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="13sp" />
+            </LinearLayout>
+
+            <com.jianyi.dict.EdgeScrollView
+                android:id="@+id/wrongScroll"
+                android:layout_width="match_parent"
+                android:layout_height="0dp"
+                android:layout_weight="1">
+
+                <LinearLayout
+                    android:id="@+id/wrongBody"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:paddingStart="22dp"
+                    android:paddingEnd="22dp"
+                    android:paddingTop="16dp"
+                    android:paddingBottom="8dp" />
+            </com.jianyi.dict.EdgeScrollView>
+
+            <com.jianyi.dict.DragHint
+                android:id="@+id/wrongHint"
+                android:layout_width="152dp"
+                android:layout_height="40dp"
+                android:layout_gravity="center_horizontal"
+                android:layout_marginBottom="12dp" />
+        </LinearLayout>
+
+        <!-- ===== 无尽配对小游戏：独立全屏页，方块自己画 ===== -->
+        <LinearLayout
+            android:id="@+id/pageGame"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:orientation="vertical"
+            android:background="@color/bg"
+            android:clickable="true"
+            android:visibility="gone">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingStart="22dp"
+                android:paddingEnd="22dp"
+                android:paddingTop="16dp">
+
+                <TextView
+                    android:id="@+id/gameBack"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/back"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="15sp"
+                    android:paddingStart="10dp"
+                    android:paddingEnd="10dp"
+                    android:paddingTop="6dp"
+                    android:paddingBottom="6dp"
+                    android:background="@drawable/input_bg" />
+
+                <TextView
+                    android:id="@+id/gameScore"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:gravity="end"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="13sp" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/gameTip"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:paddingStart="22dp"
+                android:paddingEnd="22dp"
+                android:paddingTop="10dp"
+                android:text="点英文，再点它对应的中文；整屏消干净自动换一批新词"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp" />
+
+            <com.jianyi.dict.MatchGameView
+                android:id="@+id/gameView"
+                android:layout_width="match_parent"
+                android:layout_height="0dp"
+                android:layout_weight="1" />
+        </LinearLayout>
+
+        <!-- ===== 左下角白底圆形浮动按钮：单词配对小游戏（仅查词页显示）===== -->
+        <ImageView
+            android:id="@+id/fabGame"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:layout_gravity="start|bottom"
+            android:layout_margin="16dp"
+            android:src="@drawable/ic_game"
+            android:padding="15dp"
+            android:background="@drawable/fab_circle"
+            android:elevation="6dp"
+            android:contentDescription="单词配对"
+            android:visibility="gone" />
+
+        <!-- ===== 右下角白底圆形浮动按钮：单词本（仅查词页显示）===== -->
+        <ImageView
+            android:id="@+id/fabWordBook"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:layout_gravity="end|bottom"
+            android:layout_margin="16dp"
+            android:src="@drawable/ic_fav"
+            android:padding="15dp"
+            android:background="@drawable/fab_circle"
+            android:elevation="6dp"
+            android:contentDescription="单词本"
+            android:visibility="gone" />
+
+        <!-- ===== 右下角白底圆形浮动按钮：错题集（仅记背页显示）===== -->
+        <ImageView
+            android:id="@+id/fabWrongBook"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:layout_gravity="end|bottom"
+            android:layout_margin="16dp"
+            android:src="@drawable/ic_book"
+            android:padding="15dp"
+            android:background="@drawable/fab_circle"
+            android:elevation="6dp"
+            android:contentDescription="错题集"
+            android:visibility="gone" />
+
+        <!-- ===== 左下角白底圆形浮动按钮：背词进度与计划（仅记背页显示）===== -->
+        <ImageView
+            android:id="@+id/fabStudyStats"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:layout_gravity="start|bottom"
+            android:layout_margin="16dp"
+            android:src="@drawable/ic_chart"
+            android:padding="15dp"
+            android:background="@drawable/fab_circle"
+            android:elevation="6dp"
+            android:contentDescription="背词进度"
+            android:visibility="gone" />
+
     </FrameLayout>
 </LinearLayout>

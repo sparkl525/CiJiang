@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 错题集图标：打开的书。颜色走 text_primary，随日夜自适应 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="@color/text_primary"
+        android:pathData="M12,6C10.9,5.2 9.1,4.7 7,4.7C5.6,4.7 4.2,4.9 3,5.4V18C4.2,17.5 5.6,17.3 7,17.3C9.1,17.3 10.9,17.8 12,18.6C13.1,17.8 14.9,17.3 17,17.3C18.4,17.3 19.8,17.5 21,18V5.4C19.8,4.9 18.4,4.7 17,4.7C14.9,4.7 13.1,5.2 12,6M12,18.6V6" />
+</vector>

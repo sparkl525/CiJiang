@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 背词进度图标：三根高低不同的柱子（对应高频/中频/低频三档）。颜色走 text_primary，随日夜自适应 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="@color/text_primary"
+        android:pathData="M4,12h4v8H4zM10,7h4v13h-4zM16,10h4v10h-4z" />
+</vector>
