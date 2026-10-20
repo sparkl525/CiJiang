@@ -5,6 +5,8 @@ plugins {
 dependencies {
     implementation("com.google.mlkit:translate:17.0.3")
     implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
+    // 拉丁文字专用识别器（v3.3）：纯英文/菜单/路牌比中文模型准，和中文模型双跑取置信度高的一份
+    implementation("com.google.mlkit:text-recognition:16.0.1")
 }
 
 android {
@@ -15,8 +17,8 @@ android {
         applicationId = "com.jianyi.dict"
         minSdk = 24
         targetSdk = 34
-        versionCode = 31
-        versionName = "2.0.8"
+        versionCode = 55
+        versionName = "3.9.2"
         // 只保留现代安卓手机的 64 位 ARM 架构，砍掉 x86 等无用架构（省 ~50MB）
         ndk { abiFilters.add("arm64-v8a") }
     }
