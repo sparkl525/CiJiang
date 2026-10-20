@@ -229,6 +229,74 @@ public class DictDb {
         return out;
     }
 
+    // ================= 背词顺序：六级词表按词频分档 =================
+
+    /**
+     * 出题口径：纯小写单词、有中文释义、有词频数据。
+     * cet6Count / cet6Page 共用这一份条件，改口径只改这里（改了进度分母也会跟着变）。
+     */
+    private static final String CET6_WHERE =
+            "tag LIKE '%cet6%' AND frq > 0"
+            + " AND translation IS NOT NULL AND translation <> ''"
+            + " AND word NOT LIKE '% %' AND word NOT LIKE '%-%' AND word NOT LIKE \"%'%\""
+            + " AND word NOT GLOB '*[^a-z]*'"
+            + " AND length(word) >= 3 AND length(word) <= 20";
+
+    /** 六级可用词总数——背词进度的分母 */
+    public int cet6Count() {
+        Cursor c = db.rawQuery("SELECT COUNT(*) FROM stardict WHERE " + CET6_WHERE, null);
+        int n = c.moveToFirst() ? c.getInt(0) : 0;
+        c.close();
+        return n;
+    }
+
+    /**
+     * 六级词表按词频从高到低分页（offset 从 0 开始）。
+     * frq 是 ECDICT 的当代语料库词频序号，越小越常用，所以 ORDER BY frq 就是"高频在前"。
+     * 同频次再按字母排，保证每次分页顺序一致（否则进度的游标会抖）。
+     */
+    public ArrayList<String> cet6Page(int offset, int limit) {
+        ArrayList<String> out = new ArrayList<>();
+        if (limit <= 0) return out;
+        Cursor c = db.rawQuery(
+                "SELECT word FROM stardict WHERE " + CET6_WHERE
+                        + " ORDER BY frq, word LIMIT ? OFFSET ?",
+                new String[]{String.valueOf(limit), String.valueOf(Math.max(0, offset))});
+        while (c.moveToNext()) out.add(c.getString(0));
+        c.close();
+        return out;
+    }
+
+    /**
+     * 配对小游戏的第五档：不是六级词，但释义干净、有词频、是纯单词。
+     * 按词频从常用到生僻 —— 六级词刷完之后接着出这些，别一上来就丢冷僻词。
+     */
+    private static final String OTHER_WHERE =
+            "frq > 0 AND (tag IS NULL OR tag NOT LIKE '%cet6%')"
+            + " AND translation IS NOT NULL AND translation <> ''"
+            + " AND word NOT LIKE '% %' AND word NOT LIKE '%-%' AND word NOT LIKE \"%'%\""
+            + " AND word NOT GLOB '*[^a-z]*'"
+            + " AND length(word) >= 3 AND length(word) <= 20";
+
+    public int otherCount() {
+        Cursor c = db.rawQuery("SELECT COUNT(*) FROM stardict WHERE " + OTHER_WHERE, null);
+        int n = c.moveToFirst() ? c.getInt(0) : 0;
+        c.close();
+        return n;
+    }
+
+    public ArrayList<String> otherPage(int offset, int limit) {
+        ArrayList<String> out = new ArrayList<>();
+        if (limit <= 0) return out;
+        Cursor c = db.rawQuery(
+                "SELECT word FROM stardict WHERE " + OTHER_WHERE
+                        + " ORDER BY frq, word LIMIT ? OFFSET ?",
+                new String[]{String.valueOf(limit), String.valueOf(Math.max(0, offset))});
+        while (c.moveToNext()) out.add(c.getString(0));
+        c.close();
+        return out;
+    }
+
     private static String normalize(String s) {
         return s == null ? "" : s.trim().toLowerCase(Locale.US);
     }
