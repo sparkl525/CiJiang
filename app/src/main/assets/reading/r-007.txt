@@ -1,0 +1,21 @@
+For decades, Arctic sea ice has been melting earlier in spring and freezing later in fall, extending the melt season and contributing to widespread ice loss. A new NASA-led study has found that while the Arctic melt season has lengthened dramatically since satellite records began, that trend unexpectedly stabilized around 2010.
+
+The Arctic sea ice melt season is now about 40 days longer than it was in 1979, according to the study. Most of the increase occurred before 2010. Since then, the average melt season length has remained relatively unchanged, despite large year-to-year fluctuations.
+
+Researchers analyzed satellite observations between 1979 and 2023 to track when sea ice begins to melt each spring and refreezes each autumn. They found that the change was driven primarily by sea ice freezing later in the year rather than melting earlier in the spring.
+
+"Previously, there was more of this multiyear ice that didn't melt away each summer," said Linette Boisvert, a co-author on the study and ice scientist at NASA's Goddard Space Flight Center. "Now that the ice is thinner and there's less of it, there's a lot more variability." On average, though, the decline in sea ice thickness and extent that occurred during the 2000s appears to have stopped for the time being.
+
+To understand why, the team examined changes in the Arctic's energy balance-the net difference between incoming heat from the Sun, atmosphere, and ocean and the outgoing infrared radiation emitted back to space.
+
+During the period of rapid ice loss in the 2000s, reduced ice cover exposed darker ocean water, which absorbed more sunlight. The additional solar energy delayed freezing and helped extend the melt season. In the left map above, the reddest areas mark where the melt season grew fastest that decade, by up to 5 days per year. Much of the Arctic ice today is younger and thinner than the multiyear ice that was once more widespread in the Arctic Ocean, leaving it more vulnerable to variations in cloud cover, storms, and winds.
+
+Since 2010, changing cloud patterns have reduced the amount of sunlight reaching parts of the Arctic Ocean. The result has been a melt season that fluctuates from one year to the next but remains relatively stable over longer periods. The right map above reflects this shift, with the lighter blues and reds showing the more modest rates of change during that decade.
+
+These findings don't suggest that shifts in Earth's climate have stopped affecting the Arctic. The region continues to warm nearly four times faster than the global average, and the remaining sea ice is substantially thinner than it was several decades ago. Instead, the study suggests that the Arctic may have entered a new phase, in which annual weather patterns exert a stronger influence on melt season than they once did.
+
+"Melt season length is much more dependent on atmospheric effects," Boisvert said. "They seem to be playing a bigger role because the ice is generally thinner and more vulnerable to begin with."
+
+The researchers caution that the apparent stabilization may prove temporary. Thick Arctic ice still exists throughout the year to the north of Greenland and the Canadian Arctic Archipelago. Continued thinning of ice in those regions could trigger another period of rapid sea ice loss, with the potential to further extend the melt season.
+
+For now, the study highlights the importance of continued satellite observations of Arctic sea ice and the energy balance that controls its growth and melting. Whether the recent stabilization represents a lasting change in the melt season or a pause before another period of rapid change remains an open question.

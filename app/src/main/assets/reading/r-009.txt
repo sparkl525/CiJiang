@@ -1,0 +1,31 @@
+First discovered in 2007, fast radio bursts are enigmatic, millisecond-long flashes of radio emission from the distant universe. Their origin remains uncertain, particularly since most are seen once and never again. Astronomers using NASA's James Webb Space Telescope have pinpointed the host galaxy of the most distant fast radio burst (FRB) seen to date. Their finding has implications for what kind of energetic event creates these bursts.
+
+"What makes fast radio bursts interesting is that we don't know what generates them. We have theories for what objects produce them, but we don't have conclusive proof," said Manisha Caleb of the University of Sydney, lead author on the study published Thursday in the journal Science.
+
+The MeerTRAP team used the MeerKAT telescope to detect the burst on March 4, 2024, leading to its designation as FRB 20240304B. The radio data from this burst suggested that it was extremely distant, possibly the most distant one seen to date. To confirm that distance, though, astronomers would need to study its host galaxy. Although they knew the location of the FRB very precisely, the world's largest ground-based telescopes could not see any galaxy at that spot in the sky. As a result, the team turned to the Webb telescope.
+
+Webb's NIRCam (Near-Infrared Camera) instrument detected a galaxy in the right location, and its NIRSpec (Near-Infrared Spectrograph) instrument provided a precise measurement of the galaxy's redshift : 2.148, corresponding to a time just 3 billion years after the big bang. The vast majority of FRBs detected to date occurred billions of years later in cosmic history.
+
+The team discovered that the host galaxy of FRB 20240304B was not typical of other galaxies with FRBs. Most FRB galaxies are massive star-forming galaxies, but the galaxy they found was 1,000 times less massive than they expected.
+
+"We thought it would be a big, nicely formed galaxy with lots of stars, and instead it was a little dwarf galaxy, although it was actively forming stars," said Caleb.
+
+"The host sticks out in the whole galaxy sample that we have. And it definitely was not what we were expecting," said Ben Stappers of the University of Manchester, United Kingdom, a co-author on the paper. "This combination of using the MeerTRAP project on the MeerKAT telescope to discover and localize these distant bursts and Webb to study their hosts is very exciting."
+
+The galaxy existed at the height of " cosmic noon " - a period in the history of the universe when star formation was at its peak. The galaxy's rate of star formation suggested that the majority of its stars may have formed within just 30 million years.
+
+This has important implications for the origin of fast radio bursts. One theory suggests that FRBs may originate from the merger of two neutron stars. However, the process of orbiting neutron stars gradually approaching closer and closer until they collide is expected to take billions of years. As a result, FRBs would be expected to be associated with older galaxies containing more evolved stellar populations.
+
+A second theory proposes that an FRB can originate from a single, young, highly magnetic neutron star known as a magnetar through a mechanism like starquakes. In that case, once a massive star explodes as a supernova and leaves behind a magnetar, an FRB might occur relatively quickly with no large time delay. As a result, FRBs would also be expected to be found in younger galaxies like the host of FRB 20240304B.
+
+"Our work suggests that it's very unlikely that this FRB was produced by a merger," said Caleb.
+
+"Our results further show the amazing capability of Webb where we can push boundaries beyond what was previously possible," said co-author Themiya Nanayakkara of the University of Sydney, Australia.
+
+In addition to being a record-holder, the new FRB enabled the team to learn more about the billions of light-years of apparently empty space between the burst and Earth.
+
+"A fast radio burst is almost like a cosmic flashlight. It lights up everything along the path. It carries an imprint of everything that it travels through, so you can use it to trace the 'cosmic web' - the otherwise invisible matter and structures that it encounters along the way," said co-author J. Xavier Prochaska of the University of California, Santa Cruz.
+
+The team found the imprint of two cosmic structures on the FRB's signal - one previously unknown galaxy cluster at a redshift of 0.3 (about 3.5 billion light-years from Earth), and the nearby Virgo Cluster, which is located about 54 million light-years from Earth.
+
+In the future, the team is excited about the potential to discover more distant FRBs. They estimate that the MeerKAT telescope may be able to detect and localize several FRBs per year at a redshift greater than 1.0, meaning they existed more than halfway back to the start of the universe. As other new radio telescope facilities and instruments come online, that discovery pace may grow. The Webb telescope will be essential for characterizing those distant host galaxies.
