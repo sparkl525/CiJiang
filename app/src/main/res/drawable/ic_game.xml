@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 配对游戏图标：两个实心方块 + 两个描边方块，一眼看出"两两配对"。
+     颜色走 text_primary，随日夜自适应 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <path
+        android:fillColor="@color/text_primary"
+        android:pathData="M3,3h7v7h-7z" />
+    <path
+        android:fillColor="@color/text_primary"
+        android:pathData="M14,14h7v7h-7z" />
+
+    <path
+        android:strokeColor="@color/text_primary"
+        android:strokeWidth="1.6"
+        android:fillColor="#00000000"
+        android:pathData="M14.8,3.8h5.4v5.4h-5.4z" />
+    <path
+        android:strokeColor="@color/text_primary"
+        android:strokeWidth="1.6"
+        android:fillColor="#00000000"
+        android:pathData="M3.8,14.8h5.4v5.4h-5.4z" />
+</vector>
