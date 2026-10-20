@@ -29,7 +29,7 @@ public class Quiz {
 
     /** 词性前缀，如 "n." "vt." "adj." —— 取释义时要剥掉 */
     private static final Pattern POS = Pattern.compile(
-            "^(?:n|v|vt|vi|vn|adj|adv|prep|conj|pron|num|art|int|aux|abbr|pl|pref|suff)\\s*\\.",
+            "^(?:n|v|vt|vi|vn|adj|adv|a|prep|conj|pron|num|art|int|aux|abbr|pl|pref|suff)\\s*\\.",
             Pattern.CASE_INSENSITIVE);
 
     /** 看单词选释义 */
