@@ -61,6 +61,18 @@ public class StudyDb {
                 + "level INTEGER DEFAULT 0)");
     }
 
+    /**
+     * Activity 销毁时归还句柄。不关的话每次 Activity 重建（系统回收进程后重进、
+     * 语言/字体等配置变化）都会多一个打开的 study.db，直到进程退出。
+     */
+    public void close() {
+        try {
+            db.close();
+        } catch (Throwable t) {
+            JLog.w("StudyDb.close", t);
+        }
+    }
+
     // ================= 小游戏整局存档（v3.9）=================
 
     public void setGameState(String k, int v) {
@@ -76,35 +88,49 @@ public class StudyDb {
 
     /** 存"还没消完的牌面"：每行 {word, zh, level}，顺序即牌序 */
     public void saveGamePending(ArrayList<String[]> rows) {
-        db.execSQL("DELETE FROM game_pending");
-        if (rows == null) return;
-        for (int i = 0; i < rows.size(); i++) {
-            String[] r = rows.get(i);
-            if (r == null || r.length < 2 || r[0] == null) continue;
-            int lv = 0;
-            try {
-                if (r.length > 2) lv = Integer.parseInt(r[2]);
-            } catch (NumberFormatException ignore) {
+        // 清空 + 重插在同一个事务里：中途被杀不会留下"牌面只剩一半"的存档
+        db.beginTransaction();
+        try {
+            db.execSQL("DELETE FROM game_pending");
+            if (rows != null) {
+                for (int i = 0; i < rows.size(); i++) {
+                    String[] r = rows.get(i);
+                    if (r == null || r.length < 2 || r[0] == null) continue;
+                    int lv = 0;
+                    try {
+                        if (r.length > 2) lv = Integer.parseInt(r[2]);
+                    } catch (NumberFormatException ignore) { JLog.w("StudyDb.saveGamePending", ignore);
+                     }
+                    db.execSQL("INSERT OR REPLACE INTO game_pending(ord,word,zh,level) VALUES(?,?,?,?)",
+                            new Object[]{i, r[0], r[1] == null ? "" : r[1], lv});
+                }
             }
-            db.execSQL("INSERT OR REPLACE INTO game_pending(ord,word,zh,level) VALUES(?,?,?,?)",
-                    new Object[]{i, r[0], r[1] == null ? "" : r[1], lv});
+            db.setTransactionSuccessful();
+        } finally {
+            db.endTransaction();
         }
     }
 
     public ArrayList<String[]> loadGamePending() {
         ArrayList<String[]> out = new ArrayList<>();
-        Cursor c = db.rawQuery("SELECT word, zh, level FROM game_pending ORDER BY ord", null);
-        while (c.moveToNext()) {
-            out.add(new String[]{c.getString(0), c.getString(1), String.valueOf(c.getInt(2))});
+        try (Cursor c = db.rawQuery("SELECT word, zh, level FROM game_pending ORDER BY ord", null)) {
+            while (c.moveToNext()) {
+                out.add(new String[]{c.getString(0), c.getString(1), String.valueOf(c.getInt(2))});
+            }
         }
-        c.close();
         return out;
     }
 
     /** 整局重来：清进度和残留牌面（错词回炉队列不动，那是学习记录） */
     public void clearGameState() {
-        db.execSQL("DELETE FROM game_state");
-        db.execSQL("DELETE FROM game_pending");
+        db.beginTransaction();
+        try {
+            db.execSQL("DELETE FROM game_state");
+            db.execSQL("DELETE FROM game_pending");
+            db.setTransactionSuccessful();
+        } finally {
+            db.endTransaction();
+        }
     }
 
 
@@ -117,14 +143,6 @@ public class StudyDb {
                 new Object[]{w, band, System.currentTimeMillis()});
     }
 
-    public boolean isSeen(String w) {
-        if (w == null) return false;
-        Cursor c = db.rawQuery("SELECT 1 FROM learn WHERE word=? LIMIT 1", new String[]{w});
-        boolean has = c.moveToFirst();
-        c.close();
-        return has;
-    }
-
     /** 已背过的全部词（出题时用来跳过，避免重复出现） */
     public HashSet<String> seenSet() {
         HashSet<String> out = new HashSet<>();
@@ -134,30 +152,29 @@ public class StudyDb {
         return out;
     }
 
-    /** 某档已背多少词；band < 0 表示全部 */
-    public int seenCount(int band) {
-        Cursor c = band < 0
-                ? db.rawQuery("SELECT COUNT(*) FROM learn", null)
-                : db.rawQuery("SELECT COUNT(*) FROM learn WHERE band=?",
-                        new String[]{String.valueOf(band)});
-        int n = c.moveToFirst() ? c.getInt(0) : 0;
-        c.close();
-        return n;
+    /**
+     * 三档已背数 + 总数，一条查询出齐。
+     * 原来是每档 COUNT(*) 跑一遍（外加 band<0 再数一次全表），面板一次刷新要 4 趟查询；
+     * GROUP BY 扫 learn 一遍就够了，反正这表迟早要全扫。
+     * 返回 {高频, 中频, 低频, 全部}；band 落在 0..2 之外的行只进总数，
+     * 免得旧版本留下的脏数据凭空消失。
+     */
+    public int[] seenSummary() {
+        int[] out = new int[4];
+        try (Cursor c = db.rawQuery("SELECT band, COUNT(*) FROM learn GROUP BY band", null)) {
+            while (c.moveToNext()) {
+                int n = c.getInt(1);
+                int band = c.getInt(0);
+                if (band >= 0 && band <= 2) out[band] = n;
+                out[3] += n;
+            }
+        }
+        return out;
     }
 
     /** 清空背词进度（重新开始背，不影响收藏和错题） */
     public void resetProgress() {
         db.execSQL("DELETE FROM learn");
-    }
-
-    /** 背过的词，最近背的排前面（配对小游戏的词池就取这个） */
-    public ArrayList<String> learnedWords(int limit) {
-        ArrayList<String> out = new ArrayList<>();
-        Cursor c = db.rawQuery("SELECT word FROM learn ORDER BY ts DESC LIMIT ?",
-                new String[]{String.valueOf(Math.max(1, limit))});
-        while (c.moveToNext()) out.add(c.getString(0));
-        c.close();
-        return out;
     }
 
     // ================= 配对游戏错词回炉（v3.8.2 存档）=================
@@ -222,7 +239,7 @@ public class StudyDb {
         if (!has) {
             try {
                 db.execSQL("ALTER TABLE fav ADD COLUMN fav_flag INTEGER DEFAULT 0");
-            } catch (SQLException ignore) { }
+            } catch (SQLException ignore) { JLog.w("StudyDb.ensureFavFlag", ignore);  }
         }
     }
 
@@ -235,12 +252,19 @@ public class StudyDb {
                 new Object[]{w});
     }
 
-    public boolean isMarked(String w) {
-        if (w == null) return false;
-        Cursor c = db.rawQuery("SELECT 1 FROM fav WHERE word=? LIMIT 1", new String[]{w});
-        boolean has = c.moveToFirst();
-        c.close();
-        return has;
+    /**
+     * 「其实没记住」：把词退回第一格并立刻到期，下一组就会再来。
+     *
+     * 这里不能用 mark()——它是 INSERT OR IGNORE，对已在表里的词是条空语句，
+     * 而答对时 correct() 已经把 box 升过一格、due 推到十几天后，
+     * 用户点了"没记住"却什么也没发生。
+     * 也不能用 wrong()——它会 wrong+1，把词塞进「错题集」；用户明明答对了，
+     * 只是自觉不牢，按 v3.0 的划分只该动 box/due，不动 wrong/right。
+     */
+    public void relearn(String w) {
+        if (w == null || w.isEmpty()) return;
+        mark(w);            // 没入过库的词先建行（box=0, due=0）
+        db.execSQL("UPDATE fav SET box=0, due=0 WHERE word=?", new Object[]{w});
     }
 
     // ================= 收藏（v3.0 新增：进「单词本」，与复习调度解耦）=================
@@ -248,9 +272,15 @@ public class StudyDb {
     /** 主动收藏：确保行存在并置 fav_flag=1 */
     public void favorite(String w) {
         if (w == null || w.isEmpty()) return;
-        db.execSQL("INSERT OR IGNORE INTO fav(word, box, due, wrong, right, fav_flag) VALUES(?,0,0,0,0,1)",
-                new Object[]{w});
-        db.execSQL("UPDATE fav SET fav_flag=1 WHERE word=?", new Object[]{w});
+        db.beginTransaction();
+        try {
+            db.execSQL("INSERT OR IGNORE INTO fav(word, box, due, wrong, right, fav_flag) VALUES(?,0,0,0,0,1)",
+                    new Object[]{w});
+            db.execSQL("UPDATE fav SET fav_flag=1 WHERE word=?", new Object[]{w});
+            db.setTransactionSuccessful();
+        } finally {
+            db.endTransaction();
+        }
     }
 
     /** 取消收藏：只清 fav_flag，保留 Leitner / 错词记录不动 */
@@ -300,24 +330,46 @@ public class StudyDb {
     }
 
     private void step(String w, boolean ok) {
-        if (w == null || !isMarked(w)) return;
-        Cursor c = db.rawQuery("SELECT box FROM fav WHERE word=?", new String[]{w});
-        int box = c.moveToFirst() ? c.getInt(0) : 0;
-        c.close();
-        box = ok ? Math.min(box + 1, GAPS.length - 1) : 0;
-        long due = System.currentTimeMillis() + GAPS[box];
-        db.execSQL("UPDATE fav SET box=?, due=?, wrong=wrong+?, right=right+? WHERE word=?",
-                new Object[]{box, due, ok ? 0 : 1, ok ? 1 : 0, w});
+        if (w == null) return;
+        // 「读 box → 算新格 → 写回」必须在一个事务里：连点两下答案时，
+        // 三条独立语句会读到同一个旧 box，把进步度算丢（也可能写进错误的到期时间）。
+        // 收藏状态也在这一个事务里探（SELECT box 为空即未收藏），省一次查询。
+        db.beginTransaction();
+        try {
+            int box = 0;
+            try (Cursor c = db.rawQuery("SELECT box FROM fav WHERE word=?", new String[]{w})) {
+                if (!c.moveToFirst()) {              // 没收藏过的词不做记录
+                    db.setTransactionSuccessful();
+                    return;
+                }
+                box = c.getInt(0);
+            }
+            box = ok ? Math.min(box + 1, GAPS.length - 1) : 0;
+            long due = System.currentTimeMillis() + GAPS[box];
+            db.execSQL("UPDATE fav SET box=?, due=?, wrong=wrong+?, right=right+? WHERE word=?",
+                    new Object[]{box, due, ok ? 0 : 1, ok ? 1 : 0, w});
+            db.setTransactionSuccessful();
+        } finally {
+            db.endTransaction();
+        }
     }
 
-    /** 到期的陌生词（该复习的），最多 n 个 */
+    /**
+     * 到期的陌生词（该复习的），最多 n 个。
+     *
+     * 次级排序键 rowid 不是可选的：所有新 mark 的词 due 都写成 0，
+     * 只按 due 排时这一大批全等值的行由 SQLite 随手返回，每组取 4 个就会
+     * 反复拿到同几个词，剩下收藏了几百个词的用户永远见不到它们。
+     * rowid 是建行顺序、之后不再变，于是到期时间相同的词按加入先后公平轮转。
+     */
     public ArrayList<String> dueWords(int n) {
         ArrayList<String> out = new ArrayList<>();
-        Cursor c = db.rawQuery(
-                "SELECT word FROM fav WHERE due<=? ORDER BY due LIMIT ?",
-                new String[]{String.valueOf(System.currentTimeMillis()), String.valueOf(n)});
-        while (c.moveToNext()) out.add(c.getString(0));
-        c.close();
+        try (Cursor c = db.rawQuery(
+                "SELECT word FROM fav WHERE due<=? ORDER BY due, rowid LIMIT ?",
+                new String[]{String.valueOf(System.currentTimeMillis()),
+                        String.valueOf(Math.max(0, n))})) {
+            while (c.moveToNext()) out.add(c.getString(0));
+        }
         return out;
     }
 }

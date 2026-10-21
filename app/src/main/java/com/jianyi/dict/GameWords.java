@@ -92,12 +92,12 @@ public class GameWords {
                 int lv = 0;
                 try {
                     if (row.length > 2) lv = Integer.parseInt(row[2]);
-                } catch (NumberFormatException ignore) {
-                }
+                } catch (NumberFormatException ignore) { JLog.w("GameWords.restore", ignore);
+                 }
                 resume.add(new MatchGameView.Pair(w, zh, lv));
             }
-        } catch (Throwable ignored) {
-        }
+        } catch (Throwable ignored) { JLog.w("GameWords.restore", ignored);
+         }
     }
 
     /** 退出游戏 / 切后台：把词序游标和没消完的牌存下来 */
@@ -115,8 +115,8 @@ public class GameWords {
                 rows.add(new String[]{p.en, p.zh, String.valueOf(p.level)});
             }
             study.saveGamePending(rows);
-        } catch (Throwable ignored) {
-        }
+        } catch (Throwable ignored) { JLog.w("GameWords.saveProgress", ignored);
+         }
     }
 
     private void loadPersonal() {
@@ -127,8 +127,8 @@ public class GameWords {
             for (String w : study.favoriteWords()) {
                 if (!list.contains(w)) list.add(w);
             }
-        } catch (Throwable ignored) {
-        }
+        } catch (Throwable ignored) { JLog.w("GameWords.loadPersonal", ignored);
+         }
         for (String w : list) {
             if (personal.size() >= PERSONAL_MAX) break;
             MatchGameView.Pair p = makePair(w);
@@ -255,8 +255,8 @@ public class GameWords {
         if (study != null) {
             try {
                 study.tickGameWrong();
-            } catch (Throwable ignored) {
-            }
+            } catch (Throwable ignored) { JLog.w("GameWords.onWaveStart", ignored);
+             }
         }
         return out;
     }
@@ -273,8 +273,8 @@ public class GameWords {
                 if (w == null || w.isEmpty() || zh.isEmpty()) continue;
                 out.add(new MatchGameView.Pair(w, zh));
             }
-        } catch (Throwable ignored) {
-        }
+        } catch (Throwable ignored) { JLog.w("GameWords.takeDueWrong", ignored);
+         }
         return out;
     }
 
@@ -288,15 +288,20 @@ public class GameWords {
         }
     }
 
-    /** 记一个错词：过三组（15 对）之后回来一次 */
+    /** 记一个错词：游戏内过三组（15 对）之后回来一次 */
     public synchronized void rememberWrong(MatchGameView.Pair p) {
         if (study == null || p == null) return;
         try {
-            // 队列满了就不收新的，但同一个词重复错仍然刷新倒计时
+            // 先记进「错题集」再管游戏回炉存档（#4）：
+            // study.wrong() 会把 fav.wrong 计数 +1，于是这个词会出现在查词页的「错题集」
+            // 里、并按 Leitner 盒子参与日常复习。放在存档容量判断之外，
+            // 这样即使游戏回炉队列(WRONG_MAX)已满，用户在游戏里答错的词也照样进错题集。
+            study.wrong(p.en);
+            // 游戏回炉存档：队列满了就不收新的，但同一个词重复错仍然刷新倒计时
             if (study.countGameWrong() >= WRONG_MAX && !study.hasGameWrong(p.en)) return;
             study.saveGameWrong(p.en, p.zh, WRONG_BACK_WAVES);
-        } catch (Throwable ignored) {
-        }
+        } catch (Throwable ignored) { JLog.w("GameWords.rememberWrong", ignored);
+         }
     }
 
     /** 六级高频 + 中频是否都出现过一遍了 */
@@ -329,8 +334,8 @@ public class GameWords {
         if (study != null) {
             try {
                 study.clearGameState();     // 整局重来：进度和残留牌面都清掉
-            } catch (Throwable ignored) {
-            }
+            } catch (Throwable ignored) { JLog.w("GameWords.reset", ignored);
+             }
         }
         loadPersonal();
     }
