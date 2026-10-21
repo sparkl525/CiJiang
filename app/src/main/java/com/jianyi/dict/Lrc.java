@@ -1,6 +1,7 @@
 package com.jianyi.dict;
 
 import java.util.ArrayList;
+import java.util.Collections;
 
 /**
  * LRC 字幕解析。21voa 的字幕长这样：
@@ -46,7 +47,7 @@ public class Lrc {
                 ms = Integer.parseInt(mm) * 60000L + Integer.parseInt(ss) * 1000L;
                 if (dot >= 0 && dot + 1 < rest.length()) {
                     String frac = rest.substring(dot + 1);
-                    if (isNum(frac)) ms += Long.parseLong(frac) * (frac.length() == 2 ? 10L : 1L);
+                    if (isNum(frac)) ms += Long.parseLong(frac) * fractionMillis(frac);
                 }
             } catch (NumberFormatException e) {
                 continue;
@@ -57,7 +58,21 @@ public class Lrc {
             if (text.contains("21VOA.COM") || text.contains("21voa.com")) continue;
             out.add(new Line(ms, text));
         }
+        // indexAt 靠"升序"提前 break，源文件顺序不可信，这里兜一道
+        Collections.sort(out, (a, b) -> Long.compare(a.startMs, b.startMs));
         return out;
+    }
+
+    /**
+     * 小数部分每一位代表多少毫秒。
+     * 字幕里 .5 / .04 / .123 / .0400 都出现过，位数不固定，只能按位数折算：
+     * .5 是 500ms 而不是 5ms，.0400 是 40ms 而不是 400ms。
+     */
+    private static long fractionMillis(String frac) {
+        if (frac.length() > 3) frac = frac.substring(0, 3);   // 超出 3 位是微秒噪声，丢掉
+        long unit = 1;
+        for (int i = 3 - frac.length(); i > 0; i--) unit *= 10;
+        return unit;
     }
 
     /** 当前播放位置落在第几句；没找到就返回 -1 */

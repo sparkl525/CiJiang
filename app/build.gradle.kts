@@ -17,8 +17,8 @@ android {
         applicationId = "com.jianyi.dict"
         minSdk = 24
         targetSdk = 34
-        versionCode = 55
-        versionName = "3.9.2"
+        versionCode = 62
+        versionName = "3.15.0"
         // 只保留现代安卓手机的 64 位 ARM 架构，砍掉 x86 等无用架构（省 ~50MB）
         ndk { abiFilters.add("arm64-v8a") }
     }
@@ -57,6 +57,8 @@ android {
         noCompress.add("dbz")
         // 听力音频同理：MediaPlayer 需要能直接 seek 的文件描述符，压缩了就打不开
         noCompress.add("mp3")
+        // 消除音效：SoundPool 走 AssetFileDescriptor，压缩了同样打不开
+        noCompress.add("wav")
     }
 
     compileOptions {

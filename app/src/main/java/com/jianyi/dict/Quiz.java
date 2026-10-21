@@ -20,12 +20,19 @@ public class Quiz {
 
     public static final int TYPE_MEANING = 0;
     public static final int TYPE_SPELL = 1;
+    /**
+     * 短语题（v3.10 词组训练 B）：给中文释义选英文短语，或给英文短语选中文。
+     * 复用选择题的 options/answerIndex 机制，只是题干和选项内容不同。
+     */
+    public static final int TYPE_PHRASE = 2;
 
     public int type;
     public String word;          // 正确答案的单词
     public String meaning;       // 正确答案的中文释义（取首行第一个合格义项）
     public ArrayList<String> options;   // 选择题选项，已打乱
     public int answerIndex;      // 正确项在 options 里的位置
+    /** 短语题方向：true = 给中文选英文短语；false = 给英文短语选中文 */
+    public boolean phraseAskChinese;
 
     /** 词性前缀，如 "n." "vt." "adj." —— 取释义时要剥掉 */
     private static final Pattern POS = Pattern.compile(
@@ -56,6 +63,37 @@ public class Quiz {
         q.type = TYPE_SPELL;
         q.word = word;
         q.meaning = meaning;
+        return q;
+    }
+
+    /**
+     * 出一道短语题（v3.10 词组训练 B）。
+     *
+     * @param phrase       正确短语，如 "give up"
+     * @param zh           短语的中文释义
+     * @param distractors  干扰短语（英文短语或中文释义，和 askChinese 决定）
+     * @param askChinese   true = 题干给中文、选英文短语；false = 题干给英文、选中文
+     */
+    public static Quiz phrase(String phrase, String zh, List<String> distractors,
+                              boolean askChinese, Random r) {
+        Quiz q = new Quiz();
+        q.type = TYPE_PHRASE;
+        q.word = phrase;          // 错题集里存的也是短语本身
+        q.meaning = zh;
+        q.phraseAskChinese = askChinese;
+        String answer = askChinese ? phrase : zh;
+        q.options = new ArrayList<>();
+        q.options.add(answer);
+        for (String d : distractors) {
+            if (d == null || d.isEmpty()) continue;
+            if (q.options.size() >= 4) break;
+            if (q.options.contains(d)) continue;
+            q.options.add(d);
+        }
+        // 干扰项凑不满就退化成 2 选 1 也行，但至少要有 2 个选项才像个题
+        if (q.options.size() < 2) return null;
+        Collections.shuffle(q.options, r);
+        q.answerIndex = q.options.indexOf(answer);
         return q;
     }
 

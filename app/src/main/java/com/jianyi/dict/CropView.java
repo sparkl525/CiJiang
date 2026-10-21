@@ -40,6 +40,7 @@ public class CropView extends View {
     private final Paint maskPaint = new Paint();
     private final Paint borderPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint handlePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final RectF dst = new RectF();      // 复用：拖框时每帧 new RectF 纯属白扔对象
     private float minSize;
     private float hot;          // 角柄热区半径
 
@@ -101,7 +102,8 @@ public class CropView extends View {
         dispH = bmp.getHeight() * scale;
         offX = (vw - dispW) / 2;
         offY = (vh - dispH) / 2;
-        c.drawBitmap(bmp, null, new RectF(offX, offY, offX + dispW, offY + dispH), null);
+        dst.set(offX, offY, offX + dispW, offY + dispH);
+        c.drawBitmap(bmp, null, dst, null);
 
         if (needInit) {
             // 默认框住中间大部分区域，省得用户从头拖

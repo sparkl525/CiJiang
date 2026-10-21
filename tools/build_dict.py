@@ -102,6 +102,17 @@ while True:
     print(f"  processed {total_in}/{grand}, kept {total_out}", flush=True)
 
 dst.commit()
+
+# ─── 索引：App 侧 DictDb 的查询形状依赖这两条，别删 ───
+# 建库时只声明了 word 主键，其余列全靠全表扫 + 临时 B 树排序。桌面实测（355,240 行）：
+#   背词分页 cet6Page 151ms -> 0.5ms，topWords 41ms -> 1ms，中文反查 86ms -> 10ms。
+# idx_cet6 是部分索引：只把六级词放进索引，普通查询用 idx_frq，两边都不必为对方付费。
+# 部分索引的 WHERE 必须和 DictDb.CET6_WHERE 开头那段逐字一致，规划器证明不了等价就不会用它。
+dst.execute("CREATE INDEX idx_frq ON stardict(frq)")
+dst.execute("CREATE INDEX idx_cet6 ON stardict(frq, word) WHERE "
+            "(' '||ifnull(tag,'')||' ') LIKE '% cet6 %'")
+dst.commit()
+
 dst.execute("VACUUM")
 dst.commit()
 

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 12+ 的备份/传输规则。
+     云端翻译的百度 AppSecret、腾讯云 SecretKey 存在 shared_prefs 里，
+     明文落盘；不排除就会随云备份和换机迁移流出设备。
+     学习进度在 databases，照常备份。 -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="shared_prefs" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="shared_prefs" />
+    </device-transfer>
+</data-extraction-rules>
