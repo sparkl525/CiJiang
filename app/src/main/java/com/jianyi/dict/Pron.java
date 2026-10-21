@@ -36,6 +36,7 @@ public class Pron {
     public static final int STATE_DONE = 2;
     public static final int STATE_ERROR = 3;
     public static final int STATE_OFFLINE = 4;   // 没缓存又没网：改用手机自带语音
+    public static final int STATE_NO_ENGINE = 5; // 连手机自带语音都不可用（旧机常没装英文 TTS 引擎，#10）
 
     /** 播放状态回调（主线程） */
     public interface Listener {
@@ -56,11 +57,14 @@ public class Pron {
     private volatile boolean batchRunning;
     private volatile int batchDone;
     private volatile int batchTotal;
+    /** 连着这么多个词都失败才认作断网收工，单次失败跳过即可 */
+    private static final int BATCH_FAIL_STREAK = 3;
 
     // 离线兜底：手机自带的英文语音
     private TextToSpeech tts;
     private volatile boolean ttsReady;
     private volatile boolean ttsFailed;
+    private volatile boolean ttsNoEnglish;   // 引擎起来了但没有任何英文语音（#10 旧机高发）
 
     // 预取去重：始终只保留最新待取词
     private final Object prefetchLock = new Object();
@@ -90,7 +94,9 @@ public class Pron {
         // 存在应用私有目录（不是缓存目录）：系统清理空间时不会把它删掉，离线才靠得住
         File dir = new File(ctx.getFilesDir(), "pron/" + voice);
         if (!dir.exists()) dir.mkdirs();
-        return new File(dir, md5(word.toLowerCase()) + ".mp3");
+        // 必须固定用 Locale.US：默认的 toLowerCase() 跟随系统 locale，
+        // 土耳其语环境下 I→ı 会让同一个词算出不同 key，命中不了缓存、甚至取到别的词的音频
+        return new File(dir, md5(word.trim().toLowerCase(Locale.US)) + ".mp3");
     }
 
     /** 缓存里是否已有该词发音 */
@@ -160,9 +166,9 @@ public class Pron {
             if (!isCached(w)) {
                 try {
                     ensureFile(w);
-                } catch (Throwable ignored) {
+                } catch (Throwable ignored) { JLog.w("Pron.drainPrefetch", ignored);
                     // 预取失败不打扰用户，等真正点击时再报错
-                }
+                 }
             }
         }
     }
@@ -207,47 +213,69 @@ public class Pron {
     private void ensureTts() {
         if (tts != null || ttsFailed) return;
         try {
-            tts = new TextToSpeech(ctx, status -> {
-                if (status != TextToSpeech.SUCCESS || tts == null) {
+            // 回调用局部实例，不看 this.tts：初始化回调可能在字段赋值之前就跑到，
+            // 那时 tts == null 会被误判成"引擎起不来"，永久关掉离线兜底
+            final TextToSpeech[] inst = new TextToSpeech[1];
+            inst[0] = new TextToSpeech(ctx, status -> {
+                TextToSpeech engine = inst[0];
+                if (status != TextToSpeech.SUCCESS) {
+                    // 引擎根本起不来：旧手机常见（没装/没启用 TTS 框架，或被 ROM 阉掉）
+                    JLog.w("Pron.ensureTts", "系统语音引擎初始化失败，status=" + status);
                     ttsFailed = true;
                     return;
                 }
-                int r = tts.setLanguage(getVoice() <= 1 ? Locale.UK : Locale.US);
+                if (engine == null) return;   // 回调与初始化同在主线程，正常不会走到；宁可什么都不做，也别永久禁用兜底
+                int r = engine.setLanguage(getVoice() <= 1 ? Locale.UK : Locale.US);
                 if (r < TextToSpeech.LANG_AVAILABLE) {
-                    tts.setLanguage(Locale.US);   // 没装对应口音就退回默认英文
+                    r = engine.setLanguage(Locale.US);   // 没装对应口音就退回默认英文
                 }
-                tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+                // 连默认英文都不支持 = 这台机器没有任何英文语音能力，明确记下来，
+                // 好让 UI 提示「本机没英文语音引擎，去系统设置安装」，而不是让用户干等没声音。
+                ttsNoEnglish = (r < TextToSpeech.LANG_AVAILABLE);
+                engine.setOnUtteranceProgressListener(new UtteranceProgressListener() {
                     @Override public void onStart(String utteranceId) { }
 
                     @Override public void onDone(String utteranceId) {
-                        ui.post(() -> {
-                            playingWord = null;
-                            if (lastListener != null) {
-                                lastListener.onState(utteranceId, STATE_DONE, null);
-                            }
-                        });
+                        notifySystemTts(utteranceId, STATE_DONE, null);
                     }
 
                     @Override public void onError(String utteranceId) {
-                        ui.post(() -> {
-                            playingWord = null;
-                            if (lastListener != null) {
-                                lastListener.onState(utteranceId, STATE_ERROR, "系统语音朗读失败");
-                            }
-                        });
+                        notifySystemTts(utteranceId, STATE_ERROR, "系统语音朗读失败");
                     }
                 });
                 ttsReady = true;
             });
+            tts = inst[0];
         } catch (Throwable t) {
+            JLog.w("Pron.ensureTts", t);
             ttsFailed = true;
         }
     }
 
+    /**
+     * 系统朗读引擎的结束/失败回调统一入口。
+     * 只认「还在播的那个词」：lastListener 是每次播放覆盖的全局字段，
+     * 不做这层校验的话，上一个词（或已经切走/停止之后）的迟到回调会打到新的界面上。
+     */
+    private void notifySystemTts(final String utteranceId, final int state, final String msg) {
+        ui.post(() -> {
+            if (utteranceId == null || !utteranceId.equals(playingWord)) return;
+            playingWord = null;
+            Listener l = lastListener;
+            lastListener = null;
+            if (l != null) l.onState(utteranceId, state, msg);
+        });
+    }
+
     private void fallbackTts(final String word, final Listener listener, final String reason) {
         ensureTts();
-        if (ttsFailed) {
-            if (listener != null) listener.onState(word, STATE_ERROR, reason);
+        // 引擎完全不可用，或起来了但没有英文语音能力 → 明确告诉用户原因，别静默（#10）
+        if (ttsFailed || ttsNoEnglish) {
+            if (listener != null) {
+                listener.onState(word, STATE_NO_ENGINE,
+                        "本机没有可用的英文语音引擎。可在「系统设置 → 语言和输入法 → 文字转语音」安装/启用英文语音，"
+                                + "或在联网时用「预缓存常用词」把发音存到本地。");
+            }
             return;
         }
         if (!ttsReady) {
@@ -255,7 +283,8 @@ public class Pron {
             ui.postDelayed(() -> {
                 if (!word.equals(playingWord)) return;
                 if (ttsReady) speakTts(word, listener);
-                else if (listener != null) listener.onState(word, STATE_ERROR, reason);
+                else if (listener != null) listener.onState(word, STATE_NO_ENGINE,
+                        "系统语音还没准备好，请稍后再点一次喇叭");
             }, 1200);
             return;
         }
@@ -281,12 +310,20 @@ public class Pron {
         batchDone = 0;
         batchRunning = true;
         batchPool.execute(() -> {
+            int failStreak = 0;
             for (String w : todo) {
                 if (!batchRunning) break;
                 try {
                     if (!isCached(w)) ensureFile(w);
-                } catch (Throwable ignored) {
-                    break;
+                    failStreak = 0;
+                } catch (Throwable t) {
+                    // 单个词失败不该拖垮整批：某个词被服务端拒掉、偶发一次超时都正常，
+                    // 原先这里直接 break，第 1 个词出问题整批几百个词就不预缓存了。
+                    // 连着失败才像是断网/服务不可用，这时才收工，下次接着跑。
+                    if (++failStreak >= BATCH_FAIL_STREAK) {
+                        JLog.w("Pron.startBatch 连续 " + failStreak + " 个词失败，本批预缓存中止", t);
+                        break;
+                    }
                 }
                 batchDone++;
             }
@@ -392,21 +429,22 @@ public class Pron {
 
     public void stop() {
         playingWord = null;
+        lastListener = null;          // 不留着上一次的界面回调，免得迟到的系统语音事件打到旧界面
         if (tts != null) {
             try {
                 tts.stop();
-            } catch (Throwable ignored) {
-            }
+            } catch (Throwable ignored) { JLog.w("Pron.stop", ignored);
+             }
         }
         if (player != null) {
             try {
                 if (player.isPlaying()) player.stop();
-            } catch (Throwable ignored) {
-            }
+            } catch (Throwable ignored) { JLog.w("Pron.stop", ignored);
+             }
             try {
                 player.release();
-            } catch (Throwable ignored) {
-            }
+            } catch (Throwable ignored) { JLog.w("Pron.stop", ignored);
+             }
             player = null;
         }
     }
@@ -414,15 +452,20 @@ public class Pron {
     public void release() {
         stop();
         batchRunning = false;
+        ttsFailed = false;
+        ttsNoEnglish = false;
         if (tts != null) {
             try {
                 tts.shutdown();
-            } catch (Throwable ignored) {
-            }
+            } catch (Throwable ignored) { JLog.w("Pron.release", ignored);
+             }
             tts = null;
         }
         worker.shutdownNow();
         batchPool.shutdownNow();
+        // 连接池是 EdgeTts 的静态状态，比 Pron 活得久；退出时不清的话
+        // 一条 SSLSocket 加两套缓冲会一直挂到进程结束。
+        EdgeTts.release();
     }
 
     private static String friendly(Throwable t) {
