@@ -8,6 +8,7 @@ import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.res.AssetFileDescriptor;
+import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.media.MediaPlayer;
 import android.graphics.BitmapFactory;
@@ -69,9 +70,6 @@ import java.io.InputStream;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.net.HttpURLConnection;
-import java.net.URL;
-import java.net.URLEncoder;
-import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -81,8 +79,10 @@ import java.util.Map;
 import java.util.Random;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.json.JSONArray;
@@ -97,9 +97,31 @@ public class MainActivity extends Activity {
     private HistoryDb history;
     private volatile boolean dictReady = false;
     private volatile String dictError = null;
+    private TextView dictStatus;                                   // 搜索框上方那行词典准备提示
+    private final android.os.Handler dictStatusHandler = new android.os.Handler();
     private final ExecutorService dbPool = Executors.newSingleThreadExecutor();
     private final ExecutorService netPool = Executors.newSingleThreadExecutor(); // 网络请求独立线程，不阻塞词典查询
+    private final ExecutorService packPool = Executors.newSingleThreadExecutor(); // 素材/清单下载，不和翻译排队互相等
     private final AtomicInteger searchSeq = new AtomicInteger();
+    // 联想防抖：中文反查是无索引全表扫（实测 ~130ms 一次），原先每敲一个字符
+    // 就往单线程 dbPool 塞一个任务，打 "translation" 要串行扫 22 次才出结果。
+    private final Handler suggestHandler = new Handler(Looper.getMainLooper());
+    private Runnable suggestPending;
+    private static final long SUGGEST_DEBOUNCE_MS = 160;
+
+    /** 一条还没落地的答题/复习落库记录 */
+    private static final class StudyWrite {
+        static final int CORRECT = 0, WRONG = 1, RELEARN = 2, FAV = 3, UNFAV = 4, RESET = 5;
+        final String word;
+        final int kind;
+        /** 落库完成后要在界面线程补做的刷新（比如重新渲染单词本），可为 null */
+        final Runnable after;
+        StudyWrite(String w, int k) { this(w, k, null); }
+        StudyWrite(String w, int k, Runnable r) { word = w; kind = k; after = r; }
+    }
+
+    // 排在 dbPool 里还没跑完的答题落库（见 queueStudyWrite）
+    private final ArrayList<StudyWrite> pendingStudyWrites = new ArrayList<>();
 
     private View tabDict, tabTranslate, tabCamera, pageHistory;
     private SwipeHost swipeHost;
@@ -113,6 +135,9 @@ public class MainActivity extends Activity {
     private TextView btnTranslate, translateOutput, cloudToggle;
     private Translator translatorZhEn, translatorEnZh;
     private boolean translating = false;
+    private final android.os.Handler transWatchdogHandler =
+            new android.os.Handler(android.os.Looper.getMainLooper());
+    private Runnable transWatchdog;          // 离线翻译 30 秒超时看门狗，成功/失败/退出都要撤掉
     private android.content.SharedPreferences prefs;
 
     private EditText ocrText;
@@ -153,6 +178,11 @@ public class MainActivity extends Activity {
     private TextView wbCount, wrongCount;
     private StudyDb studyDb;
     private AlertDialog studyPanelDialog;      // 背词进度面板
+    // 面板的进度快照 {高频, 中频, 低频, 全部}，null=还没读过。四个 int，留着不占地方，
+    // 换来的是一进面板不用在界面线程上数库，下次打开还能先画出旧数字再刷新。
+    private int[] studySeenSnapshot;
+    // 面板的刷新入口，随弹窗 dismiss 置空——它捕获了整棵面板视图树，留着就是留着几十个 View
+    private Runnable studyPanelRefresh;
     private boolean studySummaryCounted;       // 本组是否已经计入「今日进度」
     private ArrayList<Quiz> quizGroup;
     private int quizIndex, quizRight;
@@ -195,6 +225,7 @@ public class MainActivity extends Activity {
         String text;
         String sub;
         ArrayList<DictDb.Example> examples;  // 结果卡片下方的例句
+        ArrayList<DictDb.Phrase> phrases;    // 结果卡片下方的常用搭配（v3.10 词组训练）
     }
 
     /** 外观模式来自用户设置，必须在取资源之前改写 uiMode，否则深色不生效 */
@@ -281,6 +312,7 @@ public class MainActivity extends Activity {
         gameScore = findViewById(R.id.gameScore);
         gameTip = findViewById(R.id.gameTip);
         findViewById(R.id.gameBack).setOnClickListener(v -> closeGame());
+        dictStatus = findViewById(R.id.dictStatus);
         gameView.setOnWaveChanged(this::refreshGameTip);
         gameView.setListener((sc, cb, bs) -> {
             StringBuilder sb = new StringBuilder("得分 ").append(sc);
@@ -314,15 +346,16 @@ public class MainActivity extends Activity {
                 pageWrongBook, true, () -> updateFabs());   // 下滑退出后回到记背页（保持沉浸）
         findViewById(R.id.cropBack).setOnClickListener(v -> closeCrop());
         findViewById(R.id.btnCropAll).setOnClickListener(v -> {
-            Bitmap b = pendingOcrBmp;
-            closeCrop();
+            Bitmap b = takePendingOcr();        // 图交到我手上，回收责任也跟着过来
+            closeCrop();                        // 字段已空，这里不会再回收一次
             if (b == null) return;
             ocrText.setText("识别中…");
             runOcr(b);
         });
         findViewById(R.id.btnCropOk).setOnClickListener(v -> {
-            Bitmap b = pendingOcrBmp;
+            // cropRect() 认 CropView 里的图，必须在把图摘掉之前问
             Rect r = cropView == null ? null : cropView.cropRect();
+            Bitmap b = takePendingOcr();
             closeCrop();
             if (b == null) return;
             ocrText.setText("识别中…");
@@ -332,8 +365,15 @@ public class MainActivity extends Activity {
             }
             try {
                 Bitmap cut = Bitmap.createBitmap(b, r.left, r.top, r.width(), r.height());
-                runOcr(cut);
+                if (cut != b) {                   // 裁出来的是新图，整张原图当场放手
+                    runOcr(cut);                  // 先排任务再回收：runOcr 只碰 cut
+                    b.recycle();
+                    return;
+                }
+                runOcr(b);      // 裁剪没动刀（极少数情况下返回原图），回收交给 runOcr
             } catch (Throwable t) {
+                // 能走到这里原图必然还活着：回收只发生在 runOcr(cut) 排好任务之后
+                JLog.w("MainActivity 框选裁剪失败，退回整张识别", t);
                 runOcr(b);      // 裁剪出意外就退回整张，别让用户白拍
             }
         });
@@ -348,6 +388,7 @@ public class MainActivity extends Activity {
         translateOutput.setVerticalScrollBarEnabled(true);
         cloudToggle = findViewById(R.id.cloudToggle);
         prefs = getSharedPreferences("settings", MODE_PRIVATE);
+        CloudTrans.init(prefs);        // 云端翻译（百度/腾讯云可切换）共用这份偏好
         refreshManifests();   // 启动静默检查素材目录更新（必须在 prefs 初始化之后，否则首屏 NPE）
         pron = new Pron(this);
         findViewById(R.id.btnSettings).setOnClickListener(v -> showSettings());
@@ -392,18 +433,31 @@ public class MainActivity extends Activity {
         historyAdapter = new HistoryAdapter();
         historyList.setAdapter(historyAdapter);
         refreshHistory();
-        // 只有词典文件真的不存在时才显示"解压中"——否则每次冷启动都会闪一下这张卡
-        final boolean[] needExtract = {!dbFileReady()};
-        if (needExtract[0]) showLoading("首次启动：正在解压词典（约 50MB，仅此一次）…");
+        // 词典准备提示：不摆卡片（那东西太抢眼），只在慢设备上延迟显示一行小字。
+        // ① 全新安装：文件不存在，要解压 50MB
+        // ② 覆盖升级：老库没有 phrases 表，也要重新解压一次
+        // 两种情况都先安静地等，超过 2.5 秒还没好才提示（见 showDictStatusDelayed）。
+        final boolean needExtract = !dbFileReady();
+        if (needExtract) {
+            showDictStatusDelayed("正在准备词典（约 50MB，仅此一次）…");
+        } else if (dictNeedsUpgrade()) {
+            showDictStatusDelayed("正在更新词典（新增常用搭配，仅此一次）…");
+        }
 
         // 词典在后台线程初始化，界面绝不卡顿
-        dbPool.execute(() -> {
+        submitDb("dictInit", () -> {
             try {
                 DictDb d = new DictDb(MainActivity.this);
+                // 顺手把词数分母数出来（实测桌面 71ms、355240 行全扫带 LIKE）。
+                // 不在这儿预热的话，谁先碰到谁付这笔钱——最惨的是用户一进来就点背词面板，
+                // 那就是一下子卡住界面线程七十多毫秒起步。
+                d.cet6Count();
                 runOnUiThread(() -> {
                     dict = d;
                     dictReady = true;
-                    if (needExtract[0]) {
+                    dictStatusHandler.removeCallbacksAndMessages(null);
+                    hideDictStatus();
+                    if (needExtract) {
                         adapter.items.clear();
                         adapter.notifyDataSetChanged();
                     }
@@ -417,8 +471,12 @@ public class MainActivity extends Activity {
         tabDict.setOnClickListener(v -> switchTab(PAGE_DICT));
         tabTranslate.setOnClickListener(v -> switchTab(PAGE_TRANS));
         tabCamera.setOnClickListener(v -> switchTab(PAGE_CAM));
-        btnHistory.setOnClickListener(v -> showHistory(true));
+        // 历史按钮改成「切换」：开着就收起、关着就打开（#1）。
+        // 原来写死 showHistory(true)，导致点第二次毫无反应、历史页一旦打开就关不掉。
+        btnHistory.setOnClickListener(v -> showHistory(pageHistory.getVisibility() != View.VISIBLE));
         findViewById(R.id.titleText).setOnClickListener(v -> showHistory(false));
+        // 历史页顶部新加的「返回」：打开历史后也能一键回到查词页，不必再按系统返回
+        findViewById(R.id.historyBack).setOnClickListener(v -> showHistory(false));
         findViewById(R.id.btnClearHistory).setOnClickListener(v -> {
             history.clear();
             refreshHistory();
@@ -512,8 +570,19 @@ public class MainActivity extends Activity {
     // ================= 后台检索：联想 =================
 
     private void scheduleSuggest(String raw) {
+        scheduleSuggest(raw, false);
+    }
+
+    /**
+     * @param immediate 用户已经明确表达"就要这次查询"（按回车 / 点联想项）时走即时通道。
+     *                  防抖只该挡"正在打字"的中间态，不该让回车比不回车还慢一拍。
+     */
+    private void scheduleSuggest(String raw, boolean immediate) {
         final int seq = searchSeq.incrementAndGet();
         final String q = raw == null ? "" : raw.trim();
+        // 作废上一次击键排队中的那次查询。doLookup 同样会推 searchSeq，
+        // 所以按回车之后迟到的联想结果会在 runSuggest 的守卫处被丢掉，不会盖掉结果卡片。
+        if (suggestPending != null) suggestHandler.removeCallbacks(suggestPending);
         if (q.isEmpty()) {
             runOnUiThread(() -> {
                 if (searchSeq.get() == seq) {
@@ -533,7 +602,19 @@ public class MainActivity extends Activity {
             });
             return;
         }
-        dbPool.execute(() -> {
+        // 清空和"词典未就绪"是即时反馈，不防抖；只有真正要扫库的查询才延后一拍
+        if (immediate) {
+            runSuggest(q, seq);
+        } else {
+            suggestPending = () -> runSuggest(q, seq);
+            suggestHandler.postDelayed(suggestPending, SUGGEST_DEBOUNCE_MS);
+        }
+    }
+
+    private void runSuggest(final String q, final int seq) {
+        submitDb("runSuggest", () -> {
+            // 防抖窗口里用户又改了输入、或已经按回车查词：这一趟扫库根本没意义
+            if (searchSeq.get() != seq) return;
             ArrayList<Item> items = new ArrayList<>();
             try {
                 if (isChinese(q)) {
@@ -554,19 +635,19 @@ public class MainActivity extends Activity {
                         items.add(tip);
                     }
                 } else {
-                    ArrayList<String> sug = dict.suggest(q, 15);
-                    for (String w : sug) {
-                        DictDb.Entry e = dict.lookup(w);
+                    // 一次扫描就够：以前是拿 15 个词再逐个 lookup()，每敲一个字符
+                    // 多发 15 条查询、还把 definition 整块读进内存
+                    for (DictDb.Entry e : dict.suggestEntries(q, 15)) {
                         Item it = new Item();
                         it.type = 1;
-                        it.text = w;
+                        it.text = e.word;
                         it.entry = e;   // 带上词条，联想列表才能显示六级/高频标记
-                        it.sub = e != null ? firstLine(e.translation) : "";
+                        it.sub = firstLine(e.translation);
                         items.add(it);
                     }
                 }
-            } catch (Throwable ignored) {
-            }
+            } catch (Throwable ignored) { JLog.w("MainActivity.runSuggest", ignored);
+             }
             runOnUiThread(() -> {
                 if (searchSeq.get() != seq) return; // 已有更新的输入，丢弃旧结果
                 adapter.items = items;
@@ -587,25 +668,35 @@ public class MainActivity extends Activity {
         }
         if (isChinese(q)) {
             // 输入的是中文：按回车 = 确认反查，直接给出英文候选列表
-            scheduleSuggest(q);
+            // 回车是显式动作，不能让它比不打字还多等一个防抖窗口
+            scheduleSuggest(q, true);
             return;
         }
         final int seq = searchSeq.incrementAndGet();
-        dbPool.execute(() -> {
+        submitDb("searchJump", () -> {
             DictDb.Entry e = null;
             try {
                 e = dict.lookup(q);
-            } catch (Throwable ignored) {
-            }
+                // 词组在 stardict 里没有词条，释义只在搭配表：不兜这一下就报"未收录"
+                if (e == null) e = dict.lookupPhrase(q);
+            } catch (Throwable ignored) { JLog.w("MainActivity.doLookup", ignored);
+             }
             final DictDb.Entry found = e;
             ArrayList<DictDb.Example> exs = new ArrayList<>();
+            ArrayList<DictDb.Phrase> phs = new ArrayList<>();
             if (found != null) {
                 try {
                     exs = dict.examples(found.word);
-                } catch (Throwable ignored) {
-                }
+                } catch (Throwable ignored) { JLog.w("MainActivity.doLookup", ignored);
+                 }
+                // 常用搭配（v3.10 词组训练 A）：查这个词时带出它的固定搭配
+                try {
+                    phs = dict.phrases(found.word, 6);
+                } catch (Throwable ignored) { JLog.w("MainActivity.doLookup", ignored);
+                 }
             }
             final ArrayList<DictDb.Example> examples = exs;
+            final ArrayList<DictDb.Phrase> phrases = phs;
             runOnUiThread(() -> {
                 if (searchSeq.get() != seq) return;
                 adapter.items.clear();
@@ -617,6 +708,7 @@ public class MainActivity extends Activity {
                     it.type = 0;
                     it.entry = found;
                     it.examples = examples;
+                    it.phrases = phrases;
                     adapter.items.add(it);
                 } else {
                     Item it = new Item();
@@ -640,7 +732,32 @@ public class MainActivity extends Activity {
         }
     }
 
+    /**
+     * 手机上的词典是不是旧版（缺 phrases 表）？旧版会在初始化时重新解压一次新词典。
+     * 探测不出来就返回 false——只是少显示一句提示，不影响功能。
+     */
+    private boolean dictNeedsUpgrade() {
+        try {
+            File f = new File(getFilesDir(), "dict.db");
+            if (!f.exists() || f.length() == 0) return false;
+            android.database.sqlite.SQLiteDatabase d =
+                    android.database.sqlite.SQLiteDatabase.openDatabase(
+                            f.getPath(), null,
+                            android.database.sqlite.SQLiteDatabase.OPEN_READONLY);
+            android.database.Cursor c = d.rawQuery(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='phrases'", null);
+            boolean has = c.moveToFirst();
+            c.close();
+            d.close();
+            return !has;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     private void showLoading(String msg) {
+        // 卡片提示和顶部小字别同时出现，否则同一件事说了两遍
+        hideDictStatus();
         adapter.items.clear();
         Item it = new Item();
         it.type = 2;
@@ -648,6 +765,36 @@ public class MainActivity extends Activity {
         it.sub = "";
         adapter.items.add(it);
         adapter.notifyDataSetChanged();
+    }
+
+    // ================= 词典准备提示（不打扰式）=====================
+
+    /**
+     * 词典解压/更新时的一行提示，不占用列表区。
+     *
+     * 为什么要「延迟显示」：解 50MB 词典在快机器上只要一两秒，
+     * 一上来就摆提示等于闪一下，反而像出了问题。改成先安静地等，
+     * 超过 {@link #DICT_STATUS_DELAY_MS} 还没好才显示这行小字 ——
+     * 快机器几乎察觉不到，慢机器还能看出 App 在忙。
+     */
+    private void showDictStatus(String msg) {
+        if (dictStatus == null) return;
+        dictStatus.setText(msg);
+        dictStatus.setVisibility(View.VISIBLE);
+    }
+
+    private void hideDictStatus() {
+        if (dictStatus != null) dictStatus.setVisibility(View.GONE);
+    }
+
+    /** 超过这个时间还没解压完，才显示那行提示（毫秒） */
+    private static final long DICT_STATUS_DELAY_MS = 2500;
+
+    /** 延迟显示词典提示；已就绪时调用它什么也不做 */
+    private void showDictStatusDelayed(final String msg) {
+        dictStatusHandler.postDelayed(() -> {
+            if (!dictReady) showDictStatus(msg);
+        }, DICT_STATUS_DELAY_MS);
     }
 
     // ================= 崩溃自捕获：下次启动可查看并复制 =================
@@ -662,8 +809,8 @@ public class MainActivity extends Activity {
                 writeCrashFile(new File(getFilesDir(), "crash.log"), stamp);
                 File ext = getExternalFilesDir(null);     // 外部存储：USB 直接拉，不依赖对话框
                 if (ext != null) writeCrashFile(new File(ext, "crash.log"), stamp);
-            } catch (Throwable ignored) {
-            }
+            } catch (Throwable ignored) { JLog.w("MainActivity.setupCrashHandler", ignored);
+             }
             if (prev != null) prev.uncaughtException(t, e);
         });
     }
@@ -687,8 +834,8 @@ public class MainActivity extends Activity {
             PrintWriter pw = new PrintWriter(new FileWriter(f, true));
             pw.println(content);
             pw.close();
-        } catch (Throwable ignored) {
-        }
+        } catch (Throwable ignored) { JLog.w("MainActivity.writeCrashFile", ignored);
+         }
     }
 
     private String readCrashFile(File f) {
@@ -905,7 +1052,8 @@ public class MainActivity extends Activity {
         readingItems = new ArrayList<>();
         try {
             JSONObject root = new JSONObject(readManifest("reading"));
-            packBase = root.optString("baseUrl", packBase);
+            String base = safePackBase(root.optString("baseUrl", null));
+            if (base != null) packBase = base;
             JSONArray arr = root.optJSONArray("items");
             if (arr == null) return;
             for (int i = 0; i < arr.length(); i++) {
@@ -923,8 +1071,8 @@ public class MainActivity extends Activity {
                 it.translation = o.optString("translation");
                 readingItems.add(it);
             }
-        } catch (Throwable ignored) {
-        }
+        } catch (Throwable ignored) { JLog.w("MainActivity.loadReadingManifest", ignored);
+         }
     }
 
     private String readAsset(String name) {
@@ -962,8 +1110,8 @@ public class MainActivity extends Activity {
                 String s = bos.toString("UTF-8");
                 new JSONObject(s);          // 校验是合法 JSON，坏了就回落
                 onDisk = s;
-            } catch (Throwable ignored) {
-            }
+            } catch (Throwable ignored) { JLog.w("MainActivity.readManifest", ignored);
+             }
         }
         int onV = manifestVersion(onDisk);
         if (onV > apkV) return onDisk != null ? onDisk : apk;
@@ -1107,20 +1255,39 @@ public class MainActivity extends Activity {
         return ss;
     }
 
-    /** 阅读页点词：查词典并弹小卡片；查不到就试着去掉复数/所有格再查一次 */
+    /** 阅读页点词：查词典并弹小卡片；查不到就试着去掉复数/所有格，最后兜词组 */
     private void lookupWord(String raw) {
-        final String key = raw.toLowerCase(Locale.US).replaceAll("[^a-z']", "");
+        // 只删标点，空格必须留着：阅读页点到的可能是整条词组（"give up"），
+        // 老写法把空格一并删掉就成了 "giveup"，注定查不到。
+        final String key = raw.toLowerCase(Locale.US)
+                .replaceAll("[^a-z' ]", " ").replaceAll(" {2,}", " ").trim();
         if (key.isEmpty()) return;
-        dbPool.execute(() -> {
-            DictDb.Entry e = dict.lookup(key);
-            if (e == null && key.endsWith("s")) e = dict.lookup(key.substring(0, key.length() - 1));
-            if (e == null && key.endsWith("es")) e = dict.lookup(key.substring(0, key.length() - 2));
+        if (!dictReady || dict == null) {                       // 词典没就绪就提示，不抛 NPE
+            Toast.makeText(this, "词典还在加载，稍等一下", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        submitDb("lookupWord", () -> {
+            DictDb.Entry e;
+            try {
+                e = dict.lookup(key);
+                // 去复数只针对单个词：词组结尾的 s 属于短语本身，砍掉只会查得更偏
+                if (e == null && key.indexOf(' ') < 0 && key.endsWith("s"))
+                    e = dict.lookup(key.substring(0, key.length() - 1));
+                if (e == null && key.indexOf(' ') < 0 && key.endsWith("es"))
+                    e = dict.lookup(key.substring(0, key.length() - 2));
+                if (e == null) e = dict.lookupPhrase(key);      // 词组释义在搭配表里
+            } catch (Throwable t) {
+                // 词典句柄可能在退出时被关掉，这里必须接住：后台线程抛出去就是崩溃
+                JLog.e("MainActivity.lookupWord", t);
+                return;
+            }
             final DictDb.Entry fe = e;
             runOnUiThread(() -> showWordCard(key, fe));
         });
     }
 
     private void showWordCard(String word, DictDb.Entry e) {
+        if (isFinishing() || isDestroyed()) return;        // 弹窗晚到就是 BadTokenException + window leak
         String body = (e == null || e.translation == null || e.translation.isEmpty())
                 ? "词典里没找到这个词" : firstMeaning(e.translation);
         AlertDialog.Builder b = new AlertDialog.Builder(this)
@@ -1130,7 +1297,10 @@ public class MainActivity extends Activity {
         if (e != null) {
             b.setNeutralButton("朗读", (d, w) -> onSpeakerClick(word));
             b.setPositiveButton("加入复习", (d, w) -> {
-                if (studyDb != null) studyDb.mark(word);
+                // 别用 studyDb.mark()：它是 INSERT OR IGNORE，词只要已经在复习表里
+                // （哪怕 correct() 早把 due 推到十几天后）就是条空语句，
+                // 提示写着"已加入复习"其实什么都没发生。relearn 才等于"现在就要复习它"。
+                recordRelearn(word);
                 Toast.makeText(this, "已加入复习", Toast.LENGTH_SHORT).show();
             });
         }
@@ -1159,9 +1329,12 @@ public class MainActivity extends Activity {
     // ================= 素材包：内置之外的素材按需下载 =================
 
     private static final String PREF_PACK = "asset_pack";
-    private String packBase = "";          // 清单里给的根地址
+    private String packBase = "";          // 清单里给的根地址（只接受 https + 白名单主机，见 safePackBase）
+    private static final String[] PACK_HOSTS = {
+            "cdn.jsdelivr.net", "raw.githubusercontent.com", "github.com"};
+    private static final long MAX_PACK_BYTES = 32L * 1024 * 1024;   // 单个素材文件上限，防远端把存储灌满
+    private volatile int packDone, packTotal;   // 后台线程写、UI 线程读进度
     private volatile boolean packBusy;
-    private int packDone, packTotal;
 
     private File packDir() {
         File d = new File(getFilesDir(), "pack");
@@ -1207,8 +1380,8 @@ public class MainActivity extends Activity {
                 }
                 br.close();
                 return sb.toString();
-            } catch (Throwable ignored) {
-            }
+            } catch (Throwable ignored) { JLog.w("MainActivity.readMaterial", ignored);
+             }
         }
         return readAsset(kind + "/" + name);
     }
@@ -1238,36 +1411,32 @@ public class MainActivity extends Activity {
         packBusy = true;
         packDone = 0;
         packTotal = rels.size();
-        new Thread(() -> {
+        if (packPool.isShutdown()) return;
+        packPool.execute(() -> {
             int fail = 0;
             for (String item : rels) {
                 int sep = item.indexOf(':');
+                if (sep <= 0 || sep >= item.length() - 1) {      // 清单里的坏条目，跳过而不是抛异常
+                    JLog.w("MainActivity.downloadPack", "条目格式不对: " + item);
+                    fail++;
+                    packDone++;
+                    continue;
+                }
                 String kind = item.substring(0, sep);
                 String rel = item.substring(sep + 1);
-                try {
-                    File dir = new File(packDir(), kind);
-                    if (!dir.exists()) dir.mkdirs();
-                    File out = new File(dir, relName(rel));
-                    if (out.exists() && out.length() > 0) {
-                        packDone++;                      // 下过了就跳过，增量更新只拉新的
-                        continue;
-                    }
-                    File part = new File(dir, relName(rel) + ".part");
-                    java.net.URL u = new java.net.URL(packBase + "/" + rel);
-                    HttpURLConnection c = (HttpURLConnection) u.openConnection();
-                    c.setConnectTimeout(15000);
-                    c.setReadTimeout(60000);
-                    InputStream in = c.getInputStream();
-                    FileOutputStream fos = new FileOutputStream(part);
-                    byte[] buf = new byte[16384];
-                    int n;
-                    while ((n = in.read(buf)) > 0) fos.write(buf, 0, n);
-                    fos.close();
-                    in.close();
-                    c.disconnect();
-                    if (part.length() > 0) part.renameTo(out);   // 原子替换，防半截文件
-                    else part.delete();
-                } catch (Throwable t) {
+                File dir = new File(packDir(), kind);
+                if (!dir.exists()) dir.mkdirs();
+                File out = new File(dir, relName(rel));
+                if (out.exists() && out.length() > 0) {          // 下过了就跳过，增量更新只拉新的
+                    packDone++;
+                    continue;
+                }
+                File part = new File(dir, relName(rel) + ".part");
+                // 先写 .part 再 rename：任何一步失败都不会留下半截的正式文件
+                if (downloadToFile(packBase + "/" + rel, part) && part.renameTo(out)) {
+                    // 成功
+                } else {
+                    part.delete();
                     fail++;
                 }
                 packDone++;
@@ -1280,7 +1449,71 @@ public class MainActivity extends Activity {
                         Toast.LENGTH_SHORT).show();
                 if (onDone != null) onDone.run();
             });
-        }).start();
+        });
+    }
+
+    /**
+     * 下载单个素材文件到 dst。
+     * 非 2xx、超过 MAX_PACK_BYTES、中途断掉都算失败——返回 false 让调用方清掉临时文件。
+     * 老代码连响应码都不看，错误页会被当成素材正文存下来。
+     */
+    private boolean downloadToFile(String url, File dst) {
+        HttpURLConnection c = null;
+        try {
+            c = (HttpURLConnection) new java.net.URL(url).openConnection();
+            c.setConnectTimeout(15000);
+            c.setReadTimeout(60000);
+            int code = c.getResponseCode();
+            if (code < 200 || code >= 300) {
+                JLog.w("MainActivity.downloadToFile", "HTTP " + code + " · " + url);
+                return false;
+            }
+            if (c.getContentLengthLong() > MAX_PACK_BYTES) {
+                JLog.w("MainActivity.downloadToFile", "文件过大，拒绝：" + url);
+                return false;
+            }
+            try (InputStream in = c.getInputStream();
+                 java.io.OutputStream out = new java.io.FileOutputStream(dst)) {
+                byte[] buf = new byte[16384];
+                long total = 0;
+                int n;
+                while ((n = in.read(buf)) > 0) {
+                    total += n;
+                    if (total > MAX_PACK_BYTES) {
+                        JLog.w("MainActivity.downloadToFile", "超出大小上限，中断：" + url);
+                        return false;
+                    }
+                    out.write(buf, 0, n);
+                }
+                out.flush();
+                return total > 0;
+            }
+        } catch (Throwable t) {
+            JLog.w("MainActivity.downloadToFile", t);
+            return false;
+        } finally {
+            if (c != null) c.disconnect();
+        }
+    }
+
+    /**
+     * 清单里的 baseUrl 由远端决定，必须收窄：只认 https 且主机在白名单内。
+     * 否则一份被改过的清单就能把后续所有素材下载指向任意地址。
+     */
+    private static String safePackBase(String url) {
+        if (url == null || url.isEmpty()) return null;
+        try {
+            java.net.URL u = new java.net.URL(url);
+            if (!"https".equalsIgnoreCase(u.getProtocol())) return null;
+            String host = u.getHost() == null ? "" : u.getHost().toLowerCase(Locale.US);
+            for (String allow : PACK_HOSTS) {
+                if (host.equals(allow) || host.endsWith("." + allow)) return url;
+            }
+        } catch (Throwable t) {
+            JLog.w("MainActivity.safePackBase", t);
+        }
+        JLog.w("MainActivity.safePackBase", "非白名单地址已忽略: " + url);
+        return null;
     }
 
     /** 关闭素材包：删掉下载目录，只留 APK 内置的那点内容 */
@@ -1303,28 +1536,14 @@ public class MainActivity extends Activity {
         if (packBase == null || packBase.isEmpty()) return;     // 还没读过本地清单
         long last = prefs.getLong("manifest_refresh_ts", 0);
         if (System.currentTimeMillis() - last < 3600_000L) return;
-        new Thread(() -> {
+        if (packPool.isShutdown()) return;
+        packPool.execute(() -> {
             boolean changed = false;
             boolean anyOk = false;   // 至少一份清单真的拿到了才记时间戳，断网别把一小时额度耗掉
             for (String kind : new String[]{"listening", "reading"}) {
+                String json = fetchText(packBase + "/" + kind + ".json", 512 * 1024);
+                if (json == null) continue;
                 try {
-                    java.net.URL u = new java.net.URL(packBase + "/" + kind + ".json");
-                    HttpURLConnection c = (HttpURLConnection) u.openConnection();
-                    c.setConnectTimeout(10000);
-                    c.setReadTimeout(15000);
-                    InputStream in = c.getInputStream();
-                    ByteArrayOutputStream bos = new ByteArrayOutputStream();
-                    byte[] buf = new byte[8192];
-                    int n, total = 0;
-                    while ((n = in.read(buf)) > 0) {
-                        total += n;
-                        if (total > 512 * 1024) break;            // 清单不该这么大，防异常
-                        bos.write(buf, 0, n);
-                    }
-                    in.close();
-                    c.disconnect();
-                    if (total <= 0 || total > 512 * 1024) continue;
-                    String json = bos.toString("UTF-8");
                     int remoteV = new JSONObject(json).optInt("version", 0);
                     anyOk = true;
                     // 本地基线：下载目录里那份优先，没有就用 APK 内置的
@@ -1333,25 +1552,33 @@ public class MainActivity extends Activity {
                     if (cur.exists() && cur.length() > 0) {
                         try {
                             localV = new JSONObject(readManifest(kind)).optInt("version", 0);
-                        } catch (Throwable ignored) {
-                        }
+                        } catch (Throwable ignored) { JLog.w("MainActivity.refreshManifests", ignored);
+                         }
                     }
                     if (localV == 0) {
                         try {
                             localV = new JSONObject(readAsset(kind + "/manifest.json")).optInt("version", 0);
-                        } catch (Throwable ignored) {
-                        }
+                        } catch (Throwable ignored) { JLog.w("MainActivity.refreshManifests", ignored);
+                         }
                     }
                     if (remoteV > localV && remoteV > 0) {
                         File dir = new File(packDir(), kind);
                         if (!dir.exists()) dir.mkdirs();
                         File out = new File(dir, "manifest.json");
-                        FileOutputStream fos = new FileOutputStream(out);
-                        fos.write(json.getBytes("UTF-8"));
-                        fos.close();
-                        changed = true;
+                        File part = new File(dir, "manifest.json.part");
+                        // 先写 .part 再 rename：就地覆盖时进程被杀会留下截断的清单，
+                        // 之后每次读它都只报"素材还没准备好"，而且看不出为什么
+                        try (java.io.OutputStream os = new java.io.FileOutputStream(part)) {
+                            os.write(json.getBytes("UTF-8"));
+                        }
+                        if (part.renameTo(out)) changed = true;
+                        else {
+                            part.delete();
+                            JLog.w("MainActivity.refreshManifests", "清单落盘失败: " + kind);
+                        }
                     }
-                } catch (Throwable ignored) {
+                } catch (Throwable t) {
+                    JLog.w("MainActivity.refreshManifests", t);
                 }
             }
             if (anyOk) prefs.edit().putLong("manifest_refresh_ts", System.currentTimeMillis()).apply();
@@ -1365,7 +1592,41 @@ public class MainActivity extends Activity {
                     Toast.makeText(this, "素材目录已更新，有新内容可以看了", Toast.LENGTH_SHORT).show();
                 });
             }
-        }).start();
+        });
+    }
+
+    /** 取一个小文本（清单这类几百 KB 的东西）；非 2xx、超限、异常一律返回 null */
+    private String fetchText(String url, int maxBytes) {
+        HttpURLConnection c = null;
+        try {
+            c = (HttpURLConnection) new java.net.URL(url).openConnection();
+            c.setConnectTimeout(10000);
+            c.setReadTimeout(15000);
+            int code = c.getResponseCode();
+            if (code < 200 || code >= 300) {
+                JLog.w("MainActivity.fetchText", "HTTP " + code + " · " + url);
+                return null;
+            }
+            try (InputStream in = c.getInputStream()) {
+                ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                byte[] buf = new byte[8192];
+                int n, total = 0;
+                while ((n = in.read(buf)) > 0) {
+                    total += n;
+                    if (total > maxBytes) {
+                        JLog.w("MainActivity.fetchText", "超出大小上限: " + url);
+                        return null;
+                    }
+                    bos.write(buf, 0, n);
+                }
+                return total > 0 ? bos.toString("UTF-8") : null;
+            }
+        } catch (Throwable t) {
+            JLog.w("MainActivity.fetchText", t);
+            return null;
+        } finally {
+            if (c != null) c.disconnect();
+        }
     }
 
     /** 清单里还没下载的素材条数（用于设置页提示） */
@@ -1423,7 +1684,8 @@ public class MainActivity extends Activity {
         listenItems = new ArrayList<>();
         try {
             JSONObject root = new JSONObject(readManifest("listening"));
-            packBase = root.optString("baseUrl", packBase);
+            String base = safePackBase(root.optString("baseUrl", null));
+            if (base != null) packBase = base;
             JSONArray arr = root.optJSONArray("items");
             if (arr == null) return;
             for (int i = 0; i < arr.length(); i++) {
@@ -1443,8 +1705,8 @@ public class MainActivity extends Activity {
                 it.audio = o.optString("audio");
                 listenItems.add(it);
             }
-        } catch (Throwable ignored) {
-        }
+        } catch (Throwable ignored) { JLog.w("MainActivity.loadListenManifest", ignored);
+         }
     }
 
     private void renderListenList() {
@@ -1640,8 +1902,8 @@ public class MainActivity extends Activity {
         if (listenPlayer != null) {
             try {
                 if (listenPlayer.isPlaying()) listenPlayer.stop();
-            } catch (Throwable ignored) {
-            }
+            } catch (Throwable ignored) { JLog.w("MainActivity.releaseListen", ignored);
+             }
             listenPlayer.release();
             listenPlayer = null;
         }
@@ -1796,12 +2058,15 @@ public class MainActivity extends Activity {
      * 整组在后台线程生成好再一次性渲染。
      */
     private void buildGroup() {
-        dbPool.execute(() -> {
+        submitDb("buildGroup", () -> {
             ArrayList<Quiz> list = new ArrayList<>();
             try {
                 Random r = new Random();
                 int[] bounds = bandBounds();
-                int band = currentBand(bounds);
+                // 一次 GROUP BY 拿齐三档进度 + 总数。原来 currentBand 逐档 COUNT，
+                // 再加一次当前档 COUNT，一组题要扫 learn 四遍。
+                int[] seenBands = studyDb == null ? new int[4] : studyDb.seenSummary();
+                int band = currentBand(bounds, seenBands);
                 HashSet<String> seen = studyDb == null ? new HashSet<>() : studyDb.seenSet();
                 ArrayList<String> words = new ArrayList<>();
                 if (studyDb != null) {
@@ -1811,7 +2076,7 @@ public class MainActivity extends Activity {
                 }
                 // 当前档里从"已背到的位置"往后取：已背数当游标，天然跳过学过的词
                 int bandStart = bounds[band], bandEnd = bounds[band + 1];
-                int done = studyDb == null ? 0 : studyDb.seenCount(band);
+                int done = seenBands[band];
                 int offset = bandStart + Math.max(0, Math.min(done, bandEnd - bandStart) - 8);
                 ArrayList<String> cand = new ArrayList<>(dict.cet6Page(offset, 80));
                 if (cand.size() < 16) cand.addAll(dict.cet6Page(bandStart, 80));
@@ -1822,13 +2087,17 @@ public class MainActivity extends Activity {
                 }
                 ArrayList<String> all = dict.cet6Page(0, 800);     // 干扰项池：最高频的 800 个
                 ArrayList<String> fresh = new ArrayList<>();
+                HashSet<String> usedMeaning = new HashSet<>();  // 本组已用过的释义（#7）
                 for (String w : words) {
-                    if (list.size() >= 10) break;
+                    if (list.size() >= 8) break;          // 10 题里留 2 个位置给短语题（v3.10）
                     DictDb.Entry e = dict.lookup(w);
                     if (e == null || e.translation == null || e.translation.isEmpty()) continue;
                     ArrayList<String> ms = Quiz.meanings(e.translation, 10);
                     if (ms.isEmpty()) continue;          // 释义太碎，这个词不适合出题
                     String meaning = ms.get(0);
+                    // 同一组里两个词撞成同一个释义，会让选择题出现重复选项、拼写题答案混淆，
+                    // 用户看着就像「同一个单词反复出现」。这里按释义再挡一道。
+                    if (!usedMeaning.add(meaning)) continue;
                     if (list.size() % 2 == 0) {
                         ArrayList<String> ds = new ArrayList<>();
                         for (int k = 0; k < 40 && ds.size() < 3 && !all.isEmpty(); k++) {
@@ -1840,7 +2109,8 @@ public class MainActivity extends Activity {
                             if (oms.isEmpty()) continue;
                             String om = oms.get(0);
                             if (!Quiz.plausible(meaning, om)) continue;   // 不够迷惑就不要
-                            if (!ds.contains(om)) ds.add(om);
+                            if (usedMeaning.contains(om) || ds.contains(om)) continue;  // 排除和本组其它题撞释义的干扰项
+                            ds.add(om);
                         }
                         if (ds.size() < 3) {
                             // 干扰项凑不齐三个，改出拼写题，别让用户一眼看出答案
@@ -1856,8 +2126,16 @@ public class MainActivity extends Activity {
                 if (studyDb != null) {
                     for (String w : fresh) studyDb.seen(w, band);
                 }
-            } catch (Throwable ignored) {
-            }
+
+                // ===== 追加 2 道短语题（v3.10 词组训练 B）=====
+                // 插到第 2、5 位：题型交替着来，不全挤在末尾。
+                ArrayList<Quiz> phraseQs = buildPhraseQuestions(r, 2);
+                for (int i = phraseQs.size() - 1; i >= 0; i--) {
+                    int at = (i == 0) ? Math.min(2, list.size()) : Math.min(5, list.size());
+                    list.add(at, phraseQs.get(i));
+                }
+            } catch (Throwable ignored) { JLog.w("MainActivity.buildGroup", ignored);
+             }
             quizGroup = list;
             quizIndex = 0;
             quizRight = 0;
@@ -1886,13 +2164,16 @@ public class MainActivity extends Activity {
         return Math.max(0, Math.min(v, def));
     }
 
-    /** 现在该背哪一档：高频没背完就高频，依次往后；三档都达标就回高频复习 */
-    private int currentBand(int[] bounds) {
+    /**
+     * 现在该背哪一档：高频没背完就高频，依次往后；三档都达标就回高频复习。
+     * 进度数字由调用方给（seen = StudyDb.seenSummary()），这里不碰库——
+     * 面板要在界面线程上算「当前档」，顺手查库就会把 3 条 COUNT 甩到主线程。
+     */
+    private int currentBand(int[] bounds, int[] seen) {
         for (int b = 0; b < 3; b++) {
             int target = bandTarget(b, bounds);
             if (target <= 0) continue;
-            int done = studyDb == null ? 0 : studyDb.seenCount(b);
-            if (done < target) return b;
+            if (seen[b] < target) return b;
         }
         return 0;
     }
@@ -1918,18 +2199,51 @@ public class MainActivity extends Activity {
         track.setOrientation(LinearLayout.HORIZONTAL);
         track.setBackgroundResource(R.drawable.progress_track);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(8));
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(6));
         lp.topMargin = dp(12);
         lp.bottomMargin = dp(4);
         track.setLayoutParams(lp);
-        View fill = new View(this);
-        fill.setBackgroundResource(R.drawable.progress_fill);
-        int p = Math.max(0, Math.min(100, percent));
-        LinearLayout.LayoutParams fp = new LinearLayout.LayoutParams(0,
-                LinearLayout.LayoutParams.MATCH_PARENT, Math.max(0.001f, p / 100f));
-        fill.setLayoutParams(fp);
-        if (p > 0) track.addView(fill);
+        barFill(track, percent);
         return track;
+    }
+
+    /**
+     * 填充进度条。条上已经有填充 View 就只改它的权重，没有才 new 一个——
+     * 面板每次刷新都 removeAllViews + new View 的话，三根条一轮点按就能扔几十个 View，
+     * 每个 View 都带着自己的 background/measure 缓存，纯属白忙。
+     */
+    private void barFill(View track, int percent) {
+        if (!(track instanceof LinearLayout)) return;
+        LinearLayout bar = (LinearLayout) track;
+        int p = Math.max(0, Math.min(100, percent));
+        View fill = bar.getChildAt(0);
+        if (p == 0) {
+            if (fill != null) bar.removeAllViews();
+            return;
+        }
+        if (fill == null) {
+            fill = new View(this);
+            fill.setBackgroundResource(R.drawable.progress_fill);
+            bar.addView(fill);
+        }
+        fill.setLayoutParams(new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.MATCH_PARENT, p / 100f));
+    }
+
+    /**
+     * 面板的进度读取：一条 GROUP BY 出齐三档 + 总数，放到 dbPool 上跑。
+     * 读回来只把数字交给面板重画，视图树不动；面板已经关掉的话快照照样留着，
+     * 下次打开先拿它画一遍，省掉「统计中…」闪一下。
+     */
+    private void readStudyStats() {
+        submitDb("readStudyStats", () -> {
+            final int[] seen = studyDb == null ? new int[4] : studyDb.seenSummary();
+            runOnUiThread(() -> {
+                studySeenSnapshot = seen;
+                Runnable refresh = studyPanelRefresh;
+                if (refresh != null && !isFinishing() && !isDestroyed()) refresh.run();
+            });
+        });
     }
 
     /** 左下角 FAB：背词进度 + 计划调整 */
@@ -1938,9 +2252,8 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "词典还在加载，稍等一下", Toast.LENGTH_SHORT).show();
             return;
         }
-        final int[] bounds = bandBounds();
+        final int[] bounds = bandBounds();       // 分母已缓存，这里不再扫全表
         final int total = bounds[3];
-        final int doneAll = studyDb == null ? 0 : studyDb.seenCount(-1);
 
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
@@ -1972,18 +2285,59 @@ public class MainActivity extends Activity {
         final String[] dailyLabels = {"每天 1 组（10 词）", "每天 2 组（20 词）",
                 "每天 3 组（30 词）", "每天 5 组（50 词）"};
         final TextView[] dailyRows = new TextView[4];
+        final TextView[] targetVals = new TextView[3];
+
+        /*
+         * 面板重画：数字全部来自 studySeenSnapshot（后台读回来的进度快照），
+         * 这里一条查询都不发。
+         *
+         * 原来每点一次 −／＋ 都会 dismiss 旧面板 + 新造一棵（ScrollView、十几号
+         * TextView、三根进度条，外加它们各自的 LayoutParams），一次好几十对象白扔，
+         * 旧的还得等 GC；顺便每次都在界面线程上跑四条 COUNT。
+         * 现在视图只建一次，按钮改完 prefs 就重画一遍，库里那份进度不点「重新开始背」根本不会变。
+         */
+        final Runnable refresh = () -> {
+            int[] seen = studySeenSnapshot;
+            int daily = Math.max(1, prefs.getInt("study_daily_groups", 3));
+            if (seen == null) {
+                summary.setText("统计中…");
+                for (int b = 0; b < 3; b++) {
+                    bandRows[b].setText("");
+                    targetVals[b].setText("");
+                    barFill(bars[b], 0);
+                }
+            } else {
+                summary.setText("已背 " + seen[3] + " / " + total + " 词"
+                        + "　·　今天 " + studyDoneToday() + " / " + daily + " 组");
+                int cur = currentBand(bounds, seen);
+                for (int b = 0; b < 3; b++) {
+                    int size = bounds[b + 1] - bounds[b];
+                    int d = seen[b];
+                    int target = bandTarget(b, bounds);
+                    String mark = b == cur ? "　← 当前" : (target == 0 ? "　（跳过）" : "");
+                    bandRows[b].setText(bandName(b) + "频　已背 " + d + " / " + target
+                            + "　（本档 " + size + " 词）" + mark);
+                    bandRows[b].setTextColor(getColor(b == cur ? R.color.accent : R.color.text_secondary));
+                    // 进度条按本档目标算
+                    barFill(bars[b], target <= 0 ? 0 : Math.min(100, d * 100 / target));
+                    targetVals[b].setText(String.valueOf(target));
+                }
+            }
+            int idx = 0;
+            for (int i = 0; i < dailyOpts.length; i++) if (dailyOpts[i] == daily) idx = i;
+            refreshOptions(dailyRows, dailyLabels, idx);
+        };
+
         for (int i = 0; i < 4; i++) {
             final int idx = i;
             dailyRows[i] = optionRow(dailyLabels[i], () -> {
                 prefs.edit().putInt("study_daily_groups", dailyOpts[idx]).apply();
-                showStudyPanel();       // 重建面板，数字立刻刷新
-                if (studyPanelDialog != null) studyPanelDialog.dismiss();
+                refresh.run();            // 数字就在面板上，改完重画即可
             });
             box.addView(dailyRows[i]);
         }
 
         // 三档目标词数：− 数字 ＋
-        final TextView[] targetVals = new TextView[3];
         for (int b = 0; b < 3; b++) {
             final int band = b;
             LinearLayout line = new LinearLayout(this);
@@ -2006,8 +2360,7 @@ public class MainActivity extends Activity {
                 int step = Math.max(50, (bounds[band + 1] - bounds[band]) / 20);
                 prefs.edit().putInt("study_target_" + band,
                         Math.max(0, cur - step)).apply();
-                showStudyPanel();
-                if (studyPanelDialog != null) studyPanelDialog.dismiss();
+                refresh.run();
             });
             line.addView(minus);
 
@@ -2026,8 +2379,7 @@ public class MainActivity extends Activity {
                 int step = Math.max(50, max / 20);
                 prefs.edit().putInt("study_target_" + band,
                         Math.min(max, cur + step)).apply();
-                showStudyPanel();
-                if (studyPanelDialog != null) studyPanelDialog.dismiss();
+                refresh.run();
             });
             line.addView(plus);
 
@@ -2042,57 +2394,29 @@ public class MainActivity extends Activity {
         note.setPadding(0, dp(10), 0, dp(4));
         box.addView(note);
 
-        final Runnable refresh = () -> {
-            int daily = Math.max(1, prefs.getInt("study_daily_groups", 3));
-            summary.setText("已背 " + doneAll + " / " + total + " 词"
-                    + "　·　今天 " + studyDoneToday() + " / " + daily + " 组");
-            int cur = currentBand(bounds);
-            for (int b = 0; b < 3; b++) {
-                int size = bounds[b + 1] - bounds[b];
-                int d = studyDb == null ? 0 : studyDb.seenCount(b);
-                int target = bandTarget(b, bounds);
-                String mark = b == cur ? "　← 当前" : (target == 0 ? "　（跳过）" : "");
-                bandRows[b].setText(bandName(b) + "频　已背 " + d + " / " + target
-                        + "　（本档 " + size + " 词）" + mark);
-                bandRows[b].setTextColor(getColor(b == cur ? R.color.accent : R.color.text_secondary));
-                // 进度条按本档目标算
-                int pct = target <= 0 ? 0 : Math.min(100, d * 100 / target);
-                LinearLayout.LayoutParams lp = (LinearLayout.LayoutParams) bars[b].getLayoutParams();
-                lp.height = dp(6);
-                bars[b].setLayoutParams(lp);
-                if (bars[b] instanceof LinearLayout) {
-                    LinearLayout bar = (LinearLayout) bars[b];
-                    bar.removeAllViews();
-                    if (pct > 0) {
-                        View f = new View(this);
-                        f.setBackgroundResource(R.drawable.progress_fill);
-                        f.setLayoutParams(new LinearLayout.LayoutParams(0,
-                                LinearLayout.LayoutParams.MATCH_PARENT, pct / 100f));
-                        bar.addView(f);
-                    }
-                }
-                targetVals[b].setText(String.valueOf(target));
-            }
-            int idx = 0;
-            for (int i = 0; i < dailyOpts.length; i++) if (dailyOpts[i] == daily) idx = i;
-            refreshOptions(dailyRows, dailyLabels, idx);
-        };
-
         ScrollView sv = new ScrollView(this);
         sv.addView(box);
         studyPanelDialog = new AlertDialog.Builder(this)
                 .setTitle("背单词")
                 .setView(sv)
                 .setNegativeButton("重新开始背（清除进度）", (d, w) -> {
-                    if (studyDb != null) studyDb.resetProgress();
+                    // 全表 DELETE 可能上百毫秒，别在界面线程上等它。
+                    // 清完要重读一遍进度，快照留着旧数字的话面板会一直显示清零前。
+                    queueStudyWrite(new StudyWrite(null, StudyWrite.RESET, this::readStudyStats));
                     Toast.makeText(this, "背词进度已清零，收藏和错题不受影响",
                             Toast.LENGTH_SHORT).show();
                 })
                 .setPositiveButton("关闭", null)
                 .create();
-        studyPanelDialog.setOnShowListener(d -> refresh.run());
+        // 刷新入口只在面板开着的时候交出去：它捕获了整棵面板视图树，
+        // 弹窗一关不撒手的话，三十来个 View 就得跟着 Activity 活到下次开面板。
+        studyPanelRefresh = refresh;
+        studyPanelDialog.setOnDismissListener(d -> {
+            if (studyPanelRefresh == refresh) studyPanelRefresh = null;
+        });
+        refresh.run();          // 先拿上次的快照画一遍，面板不至于空着等查询
         studyPanelDialog.show();
-        refresh.run();
+        readStudyStats();       // 再后台读最新的进度，回来重画数字
     }
 
     /** 面板里的小圆角按钮（− ＋） */
@@ -2126,11 +2450,21 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "词典还在加载，稍等一下", Toast.LENGTH_SHORT).show();
             return;
         }
+        // 进游戏前把查词框的焦点交出去、键盘收掉（#6）：
+        // 不这么做的话，从查词页直接点游戏按钮时 searchBox 还留着焦点，
+        // 之后从桌面切回前台（尤其小屏机 adjustResize）系统会自动把输入法弹出来。
+        hideKeyboard();
+        // 进游戏前把音效开关状态同步给 gameView（放在 openGame 而不是 onCreate，
+        // 因为 onCreate 里 prefs 还没初始化完，早读会 NPE）
+        if (gameView != null && prefs != null) {
+            gameView.setSfxEnabled(prefs.getBoolean("game_sfx", true));
+            gameView.setVibeEnabled(prefs.getBoolean("game_vibe", true));
+        }
         applyImmersive(true);
         slideIn(pageGame, false);
         updateFabs();
         gameScore.setText("准备中…");
-        dbPool.execute(() -> {
+        submitDb("gamePrepare", () -> {
             final GameWords src = new GameWords(dict, studyDb);
             src.prepare();                       // 读个人词 + 算分档边界，可能要几百毫秒
             runOnUiThread(() -> {
@@ -2189,6 +2523,24 @@ public class MainActivity extends Activity {
         return firstLine(translation).trim();
     }
 
+    /** 题干提示语：不同题型说不同的话（v3.10 加了短语题） */
+    private static String quizHeadText(Quiz q) {
+        if (q.type == Quiz.TYPE_MEANING) return "选出正确的释义";
+        if (q.type == Quiz.TYPE_PHRASE) {
+            return q.phraseAskChinese ? "这个意思的常用搭配是？" : "这个搭配是什么意思？";
+        }
+        return "拼出这个单词";
+    }
+
+    /** 题干主体：选择题给英文，拼写题给中文，短语题看方向 */
+    private static String quizTitleText(Quiz q) {
+        if (q.type == Quiz.TYPE_MEANING) return q.word;
+        if (q.type == Quiz.TYPE_PHRASE) {
+            return q.phraseAskChinese ? q.meaning : q.word;
+        }
+        return q.meaning;
+    }
+
     private void renderQuiz() {
         studyBody.removeAllViews();
         if (quizGroup == null || quizGroup.isEmpty()) {
@@ -2208,20 +2560,22 @@ public class MainActivity extends Activity {
         studyProgress.setText("第 " + (quizIndex + 1) + " / " + quizGroup.size() + "　答对 " + quizRight);
 
         TextView head = new TextView(this);
-        head.setText(q.type == Quiz.TYPE_MEANING ? "选出正确的释义" : "拼出这个单词");
+        head.setText(quizHeadText(q));
         head.setTextColor(getColor(R.color.text_secondary));
         head.setTextSize(13);
         studyBody.addView(head);
 
         TextView title = new TextView(this);
-        title.setText(q.type == Quiz.TYPE_MEANING ? q.word : q.meaning);
+        title.setText(quizTitleText(q));
         title.setTextColor(getColor(R.color.text_primary));
         title.setTextSize(24);
         title.setTypeface(null, Typeface.BOLD);
         title.setPadding(0, dp(10), 0, dp(6));
         studyBody.addView(title);
 
-        if (q.type == Quiz.TYPE_MEANING) {
+        // 按"有没有选项"分支，而不是按题型：TYPE_PHRASE 也带 options，
+        // 只有 Quiz.spell() 造出来的题 options 为 null。用 type 判会漏掉短语题。
+        if (q.options != null && !q.options.isEmpty()) {
             for (int i = 0; i < q.options.size(); i++) {
                 final int idx = i;
                 TextView opt = optionButton(q.options.get(i));
@@ -2259,6 +2613,18 @@ public class MainActivity extends Activity {
                 }
                 return false;
             });
+
+            // 光标自动落到这条输入框：老写法只把 EditText 加进布局，焦点还在原来的控件上，
+            // 用户必须先去点一下那条空行才能打字——键盘明明常驻也没用。
+            // post 是必需的：视图刚 addView 还没走完 measure/layout，
+            // 这时 showSoftInput 一定失败（也是这条路径以前弹不出键盘的原因）。
+            input.setFocusableInTouchMode(true);
+            if (isPageVisible(pageStudy)) {
+                input.requestFocus();
+                studyBody.post(() -> {
+                    if (isPageVisible(pageStudy)) showKeyboard(input);
+                });
+            }
         }
 
         TextView forgot = new TextView(this);
@@ -2268,12 +2634,82 @@ public class MainActivity extends Activity {
         forgot.setPadding(dp(4), dp(26), dp(4), dp(10));
         forgot.setOnClickListener(v -> {
             // "不认识"等同于答错：既进复习，也计入错题集
-            if (studyDb != null) studyDb.wrong(q.word);
+            recordAnswer(q.word, false);
             if (!quizWrongWords.contains(q.word)) quizWrongWords.add(q.word);
             Toast.makeText(this, "已加入复习和错题集", Toast.LENGTH_SHORT).show();
             nextQuiz();
         });
         studyBody.addView(forgot);
+    }
+
+    /**
+     * 出短语题（v3.10 词组训练 B）。
+     *
+     * 一半「给中文选英文短语」、一半「给英文短语选中文」，两种方向轮着来。
+     * 干扰项从搭配库里再取，长度和结构要接近才迷惑——
+     * 拿 "give up" 去和 "read book" 放一起，一眼就能排除，等于送分。
+     */
+    private ArrayList<Quiz> buildPhraseQuestions(Random r, int want) {
+        ArrayList<Quiz> out = new ArrayList<>();
+        if (want <= 0 || dict == null) return out;
+        ArrayList<DictDb.Phrase> pool;
+        try {
+            pool = dict.phrasePool(60);
+        } catch (Throwable t) {
+            return out;
+        }
+        if (pool.size() < 4) return out;
+
+        // 答案只从"常用搭配"里挑：score 太低的是生僻搭配，当答案用户根本不认识，
+        // 当干扰项才合适。（core 小品词类 score 在 170+，普通介词类 150+）
+        final int ANSWER_MIN_SCORE = 150;
+
+        ArrayList<DictDb.Phrase> used = new ArrayList<>();
+        for (int i = 0; i < want; i++) {
+            DictDb.Phrase target = null;
+            for (DictDb.Phrase p : pool) {
+                if (p.score < ANSWER_MIN_SCORE) continue;
+                if (used.contains(p)) continue;
+                target = p;
+                break;
+            }
+            if (target == null) break;
+            used.add(target);
+
+            boolean askChinese = (i % 2 == 0);
+            // 干扰项：同一方向（askChinese 决定比英文短语还是比中文释义）
+            ArrayList<String> ds = new ArrayList<>();
+            for (int k = 0; k < 80 && ds.size() < 3; k++) {
+                DictDb.Phrase cand = pool.get(r.nextInt(pool.size()));
+                if (cand == null || used.contains(cand)) continue;
+                String text = askChinese ? cand.phrase : cand.zh;
+                if (text == null || text.isEmpty()) continue;
+                if (askChinese) {
+                    if (!text.contains(" ")) continue;                 // 必须是短语，不能是单词
+                    if (!phraseSimilar(target.phrase, text)) continue; // 长度差太多一眼排除
+                } else {
+                    if (!phraseZhSimilar(target.zh, text)) continue;
+                }
+                if (!ds.contains(text)) ds.add(text);
+            }
+            if (ds.size() < 2) continue;      // 凑不够就不出这道题，宁缺毋滥
+            Quiz q = Quiz.phrase(target.phrase, target.zh, ds, askChinese, r);
+            if (q != null) out.add(q);
+        }
+        return out;
+    }
+
+    /** 两个英文短语像不像：单词数相同、字符数差不超过 5 */
+    private static boolean phraseSimilar(String a, String b) {
+        if (a == null || b == null) return false;
+        if (a.split(" ").length != b.split(" ").length) return false;
+        return Math.abs(a.length() - b.length()) <= 5;
+    }
+
+    /** 两个中文释义像不像：字数差不超过 3 */
+    private static boolean phraseZhSimilar(String a, String b) {
+        if (a == null || b == null) return false;
+        return Math.abs(a.length() - b.length()) <= 3;
     }
 
     /** 统一的选项/按钮样式：柔和圆角，和翻译页按钮一致 */
@@ -2292,13 +2728,119 @@ public class MainActivity extends Activity {
         return t;
     }
 
+    /**
+     * 答题落库挪到 dbPool。
+     * 原先每点一个选项都在主线程同步开一个写事务（SELECT box → UPDATE → 提交），
+     * 是出题流程里唯一卡在指尖下的磁盘 IO，低端机上就是"点下去卡顿一下"。
+     *
+     * 顺序是安全的：dbPool 单线程 FIFO，下一题触发的 buildGroup 一定排在这次落库之后，
+     * 读到的必然是新状态。唯一的坑是 onDestroy 用 shutdownNow() 会把还没跑到的任务丢掉
+     * = 丢进度，所以留一份待写清单，销毁前补做完。
+     */
+    private void recordAnswer(String word, boolean ok) {
+        queueStudyWrite(new StudyWrite(word, ok ? StudyWrite.CORRECT : StudyWrite.WRONG));
+    }
+
+    /**
+     * 「其实没记住」也走同一条队列：它必须排在本次 correct() 之后，
+     * 否则两步会互相抵消（升格和退格的先后一旦乱掉，词就还留在高格子里）。
+     */
+    private void recordRelearn(String word) {
+        queueStudyWrite(new StudyWrite(word, StudyWrite.RELEARN));
+    }
+
+    private void queueStudyWrite(final StudyWrite job) {
+        if (studyDb == null) return;
+        // RESET 不针对某个词，其余种类没词就没意义（别往表里写空行）
+        if (job.word == null && job.kind != StudyWrite.RESET) return;
+        synchronized (pendingStudyWrites) { pendingStudyWrites.add(job); }
+        submitDb("queueStudyWrite", () -> {
+            try {
+                // 动手之前先从待写清单里把这条认领回来。认领不到就说明
+                // flushPendingStudyWrites()（退出补做）已经替它落过库了，
+                // 再跑一次等于同一个答案记两遍、step() 的读改写互相覆盖。
+                if (claimStudyWrite(job)) applyStudyWrite(job);
+            } finally {
+                // 列表要在数据真正落库之后再刷，否则读到的还是旧内容
+                if (job.after != null) runOnUiThread(job.after);
+            }
+        });
+    }
+
+    /** 从待写清单里认领一条。返回 false = 退出时已经补做过了，这活儿不用再干 */
+    private boolean claimStudyWrite(StudyWrite job) {
+        synchronized (pendingStudyWrites) {
+            return pendingStudyWrites.remove(job);
+        }
+    }
+
+    private void applyStudyWrite(StudyWrite j) {
+        switch (j.kind) {
+            case StudyWrite.CORRECT: studyDb.correct(j.word); break;
+            case StudyWrite.WRONG:   studyDb.wrong(j.word); break;
+            case StudyWrite.FAV:     studyDb.favorite(j.word); break;
+            case StudyWrite.UNFAV:   studyDb.unfavorite(j.word); break;
+            case StudyWrite.RESET:   studyDb.resetProgress(); break;
+            default:                 studyDb.relearn(j.word); break;
+        }
+    }
+
+    /** 退出前把还排在队列里的落库补做完，别丢进度 */
+    private void flushPendingStudyWrites() {
+        ArrayList<StudyWrite> left;
+        synchronized (pendingStudyWrites) {
+            left = new ArrayList<>(pendingStudyWrites);
+            pendingStudyWrites.clear();
+        }
+        for (StudyWrite j : left) {
+            try {
+                applyStudyWrite(j);
+            } catch (Throwable t) {
+                JLog.w("MainActivity.flushPendingStudyWrites", t);
+            }
+        }
+    }
+
+    /**
+     * 往 dbPool 提交工作的唯一入口（别再用裸 dbPool.execute）。
+     *
+     * onDestroy 是 shutdownNow() 收摊，之后任何一次迟到的点击、看门狗、后台回调再提交，
+     * 抛的都是主线程上的 RejectedExecutionException = 直接闪退。兜住它，
+     * 「这活儿不干了」交回调用方处理（识别用的位图就靠这一步回收）。
+     *
+     * 顺手把 body 里的异常也接住：库被关掉之后跑到的读任务会抛
+     * "database has been closed"，那同样是不该炸给用户看的。
+     */
+    private void submitDb(String tag, Runnable body) {
+        submitDb(tag, body, null);
+    }
+
+    private void submitDb(String tag, Runnable body, Runnable onRejected) {
+        if (isFinishing() || isDestroyed()) {
+            if (onRejected != null) onRejected.run();
+            return;
+        }
+        try {
+            dbPool.execute(() -> {
+                try {
+                    body.run();
+                } catch (Throwable t) {
+                    JLog.w("MainActivity." + tag, t);
+                }
+            });
+        } catch (Throwable t) {
+            JLog.w("MainActivity." + tag + " 提交失败（线程池已收摊）", t);
+            if (onRejected != null) onRejected.run();
+        }
+    }
+
     private void answer(Quiz q, boolean ok) {
         if (ok) {
             quizRight++;
-            if (studyDb != null) studyDb.correct(q.word);
+            recordAnswer(q.word, true);
         } else {
             if (!quizWrongWords.contains(q.word)) quizWrongWords.add(q.word);
-            if (studyDb != null) studyDb.wrong(q.word);   // 答错自动进复习
+            recordAnswer(q.word, false);   // 答错自动进复习
         }
         studyBody.removeAllViews();
 
@@ -2319,8 +2861,11 @@ public class MainActivity extends Activity {
         if (ok) {
             TextView keep = optionButton("其实没记住，加入复习");
             keep.setOnClickListener(v -> {
-                if (studyDb != null) studyDb.mark(q.word);
-                Toast.makeText(this, "已加入复习", Toast.LENGTH_SHORT).show();
+                // 必须用 relearn 不能用 mark：上面 correct() 已把这个词升了一格、
+                // due 推到十几天后，而 mark() 是 INSERT OR IGNORE，对已存在的词是空操作，
+                // 点了按钮等于什么都没发生。
+                recordRelearn(q.word);
+                Toast.makeText(this, "已退回第一格，下组再来", Toast.LENGTH_SHORT).show();
                 nextQuiz();
             });
             studyBody.addView(keep);
@@ -2432,48 +2977,66 @@ public class MainActivity extends Activity {
     }
 
     private void renderWordBook() {
+        // 词表本身也要到后台线程去取：收藏几百个词时这条 SELECT 不是零成本
         renderBook(wbBody, wbCount,
-                studyDb == null ? new ArrayList<String>() : studyDb.favoriteWords(),
+                () -> studyDb == null ? new ArrayList<String>() : studyDb.favoriteWords(),
                 "单词本", true);
     }
 
     private void renderWrongBook() {
         renderBook(wrongBody, wrongCount,
-                studyDb == null ? new ArrayList<String>() : studyDb.wrongWords(),
+                () -> studyDb == null ? new ArrayList<String>() : studyDb.wrongWords(),
                 "错题集", false);
     }
 
-    /** 通用渲染：一列词卡（词 + 首义），后台查释义后一次性上屏；点开看详情，收藏本可取消收藏 */
+    /** 通用渲染：词表 + 释义都在后台取，回来一次性上屏；点开看详情，收藏本可取消收藏 */
     private void renderBook(final LinearLayout body, final TextView count,
-                            final ArrayList<String> words, final String title, final boolean canUnfav) {
+                            final Callable<ArrayList<String>> fetch,
+                            final String title, final boolean canUnfav) {
         if (body == null) return;
         body.removeAllViews();
-        if (count != null) count.setText(words.isEmpty() ? "" : words.size() + " 个");
-        if (words.isEmpty()) {
-            TextView empty = new TextView(this);
-            empty.setText("单词本".equals(title)
-                    ? "还没有收藏的词。查词时点词条上的星标即可收进这里。"
-                    : "还没有错题。记背答题答错的词会自动收进这里。");
-            empty.setTextColor(getColor(R.color.text_secondary));
-            empty.setTextSize(15);
-            empty.setPadding(dp(4), dp(24), dp(4), dp(4));
-            body.addView(empty);
-            return;
-        }
+        if (count != null) count.setText("");
         TextView loading = new TextView(this);
         loading.setText("加载中…");
         loading.setTextColor(getColor(R.color.text_secondary));
         loading.setTextSize(15);
         body.addView(loading);
-        dbPool.execute(() -> {
+        submitDb("renderBook", () -> {
+            final ArrayList<String> words;
+            ArrayList<String> got;
+            try {
+                got = fetch.call();
+            } catch (Throwable t) {
+                JLog.w("MainActivity.renderBook 取词表失败", t);
+                got = new ArrayList<>();
+            }
+            words = got;
             final ArrayList<DictDb.Entry> entries = new ArrayList<>();
             for (String w : words) {
                 DictDb.Entry e = null;
-                try { e = dict.lookup(w); } catch (Throwable ignore) {}
+                try {
+                    e = dict.lookup(w);
+                    // 错题集里的词组在 stardict 没有词条，释义只存在搭配表里；
+                    // 不兜这一下，列表里就是一排"（未收录）"。
+                    if (e == null) e = dict.lookupPhrase(w);
+                } catch (Throwable ignore) { JLog.w("MainActivity.renderBook", ignore); }
                 entries.add(e);
             }
             runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed()) return;
                 body.removeAllViews();
+                if (count != null) count.setText(words.isEmpty() ? "" : words.size() + " 个");
+                if (words.isEmpty()) {
+                    TextView empty = new TextView(this);
+                    empty.setText("单词本".equals(title)
+                            ? "还没有收藏的词。查词时点词条上的星标即可收进这里。"
+                            : "还没有错题。记背答题答错的词会自动收进这里。");
+                    empty.setTextColor(getColor(R.color.text_secondary));
+                    empty.setTextSize(15);
+                    empty.setPadding(dp(4), dp(24), dp(4), dp(4));
+                    body.addView(empty);
+                    return;
+                }
                 for (int i = 0; i < words.size(); i++) {
                     body.addView(buildBookRow(words.get(i), entries.get(i), title, canUnfav));
                 }
@@ -2523,9 +3086,9 @@ public class MainActivity extends Activity {
         if (e != null) b.setNeutralButton("朗读", (d, w) -> onSpeakerClick(word));
         if (canUnfav) {
             b.setPositiveButton("取消收藏", (d, w) -> {
-                if (studyDb != null) studyDb.unfavorite(word);
+                // 写库挪到 dbPool，落库完成后再刷新列表
+                queueStudyWrite(new StudyWrite(word, StudyWrite.UNFAV, this::renderWordBook));
                 Toast.makeText(this, "已取消收藏", Toast.LENGTH_SHORT).show();
-                renderWordBook();
             });
         }
         b.show();
@@ -2536,20 +3099,37 @@ public class MainActivity extends Activity {
         final ImageView star = new ImageView(this);
         int pad = dp(8);
         star.setPadding(pad, pad, pad, pad);
-        final boolean fav = studyDb != null && studyDb.isFavorite(word);
-        star.setImageResource(fav ? R.drawable.ic_fav : R.drawable.ic_fav_border);
+        // 这里不能同步查 isFavorite()：它在列表行的 getView() 里，每滑出一行就是
+        // 一次界面线程 I/O。先按未收藏画，后台查完再点亮。
+        star.setImageResource(R.drawable.ic_fav_border);
+        final boolean[] marked = {false};
+        final boolean[] touched = {false};   // 用户点过就以用户为准，别让迟到的查询结果盖回去
         star.setOnClickListener(v -> {
             if (studyDb == null) return;
-            if (studyDb.isFavorite(word)) {
-                studyDb.unfavorite(word);
-                star.setImageResource(R.drawable.ic_fav_border);
-                Toast.makeText(this, "已取消收藏", Toast.LENGTH_SHORT).show();
-            } else {
-                studyDb.favorite(word);
-                star.setImageResource(R.drawable.ic_fav);
-                Toast.makeText(this, "已收进单词本", Toast.LENGTH_SHORT).show();
-            }
+            touched[0] = true;
+            marked[0] = !marked[0];
+            star.setImageResource(marked[0] ? R.drawable.ic_fav : R.drawable.ic_fav_border);
+            Toast.makeText(this, marked[0] ? "已收进单词本" : "已取消收藏",
+                    Toast.LENGTH_SHORT).show();
+            queueStudyWrite(new StudyWrite(word,
+                    marked[0] ? StudyWrite.FAV : StudyWrite.UNFAV, null));
         });
+        if (studyDb != null) {
+            submitDb("buildFavorite", () -> {
+                final boolean fav;
+                try {
+                    fav = studyDb.isFavorite(word);
+                } catch (Throwable t) {
+                    JLog.w("MainActivity.buildFavorite", t);
+                    return;
+                }
+                runOnUiThread(() -> {
+                    if (touched[0]) return;
+                    marked[0] = fav;
+                    star.setImageResource(fav ? R.drawable.ic_fav : R.drawable.ic_fav_border);
+                });
+            });
+        }
         return star;
     }
 
@@ -2620,7 +3200,7 @@ public class MainActivity extends Activity {
             // 皮肤：从相册选背景图（解码裁剪较重，放后台线程）
             if (res == RESULT_OK && data != null && data.getData() != null) {
                 final Uri u = data.getData();
-                dbPool.execute(() -> {
+                submitDb("saveSkin", () -> {
                     final boolean ok = saveSkinBitmap(u);
                     runOnUiThread(() -> {
                         if (ok) {
@@ -2645,7 +3225,7 @@ public class MainActivity extends Activity {
         final Uri uri = req == 100 ? pendingPhotoUri : (data == null ? null : data.getData());
         if (uri == null) return;
         ocrText.setText("识别中…");
-        dbPool.execute(() -> {
+        submitDb("loadImage", () -> {
             final Bitmap bmp;
             try {
                 bmp = loadBitmap(uri);
@@ -2659,6 +3239,13 @@ public class MainActivity extends Activity {
 
     /** 拍照/选图后先进入框选：拖框决定识别哪一块，避免整页无关文字混进来 */
     private void showCrop(Bitmap bmp) {
+        if (isFinishing() || isDestroyed()) {
+            // 后台解完图才切回界面，中间用户已经退出了：onDestroy 的 releasePendingOcr()
+            // 早跑完了，这张图挂上去就没人收，当场放手。
+            recycleOcrPair(bmp, null);
+            return;
+        }
+        releasePendingOcr();        // 上一张还没放手的话先收掉，不然连着两次选图就是 24MB
         pendingOcrBmp = bmp;
         if (cropView != null) cropView.setBitmap(bmp);
         if (pageCrop != null) pageCrop.setVisibility(View.VISIBLE);
@@ -2667,30 +3254,47 @@ public class MainActivity extends Activity {
 
     private void closeCrop() {
         if (pageCrop != null) pageCrop.setVisibility(View.GONE);
+        releasePendingOcr();
+    }
+
+    /**
+     * 把待识别的图交给调用方，同时摘掉字段——此后谁拿走谁回收。
+     * 拿走之后调 closeCrop() 不会重复回收（字段已经空了）。
+     */
+    private Bitmap takePendingOcr() {
+        Bitmap b = pendingOcrBmp;
+        pendingOcrBmp = null;
+        if (cropView != null) cropView.setBitmap(null);
+        return b;
+    }
+
+    /** 框选页一收就把图还给系统：最长边 2000px 的相机图是 12MB，等 GC 不划算 */
+    private void releasePendingOcr() {
+        Bitmap b = takePendingOcr();
+        if (b != null && !b.isRecycled()) b.recycle();
     }
 
     /** 读取图片并缩到最长边约 2000px，防低配手机内存爆炸；顺带按 EXIF 摆正方向 */
     private Bitmap loadBitmap(Uri uri) throws Exception {
         int orientation = 0;
-        try {
-            InputStream meta = getContentResolver().openInputStream(uri);
+        try (InputStream meta = getContentResolver().openInputStream(uri)) {
             orientation = exifOrientation(meta);
-            if (meta != null) meta.close();
-        } catch (Throwable ignored) {
-        }
+        } catch (Throwable ignored) { JLog.w("MainActivity.loadBitmap", ignored);
+         }
         BitmapFactory.Options probe = new BitmapFactory.Options();
         probe.inJustDecodeBounds = true;
-        InputStream s = getContentResolver().openInputStream(uri);
-        BitmapFactory.decodeStream(s, null, probe);
-        if (s != null) s.close();
+        try (InputStream s = getContentResolver().openInputStream(uri)) {
+            BitmapFactory.decodeStream(s, null, probe);
+        }
         int sample = 1;
         while (probe.outWidth / sample > 2000 || probe.outHeight / sample > 2000) sample *= 2;
         BitmapFactory.Options opts = new BitmapFactory.Options();
         opts.inSampleSize = sample;
         opts.inPreferredConfig = Bitmap.Config.ARGB_8888;
-        InputStream s2 = getContentResolver().openInputStream(uri);
-        Bitmap b = BitmapFactory.decodeStream(s2, null, opts);
-        if (s2 != null) s2.close();
+        Bitmap b;
+        try (InputStream s2 = getContentResolver().openInputStream(uri)) {
+            b = BitmapFactory.decodeStream(s2, null, opts);
+        }
         if (b == null) throw new Exception("图片解码失败");
         if (orientation != 0 && orientation != 1) {
             Matrix m = new Matrix();
@@ -2704,7 +3308,10 @@ public class MainActivity extends Activity {
                 case 7: m.postRotate(270); m.postScale(-1, 1); break;
                 default: break;
             }
-            b = Bitmap.createBitmap(b, 0, 0, b.getWidth(), b.getHeight(), m, true);
+            // createBitmap 会新建一张；原图不回收就在后台线程里堆出两份全屏位图
+            Bitmap rotated = Bitmap.createBitmap(b, 0, 0, b.getWidth(), b.getHeight(), m, true);
+            if (rotated != b) b.recycle();
+            b = rotated;
         }
         return b;
     }
@@ -2769,13 +3376,19 @@ public class MainActivity extends Activity {
      * 识别一张图。v3.3 起两件事变了：
      * 1) 小图先放大——框选一小块菜单时字高常常只有十几像素，ML Kit 要求 ≥32px 才稳；
      * 2) 拉丁模型和中文模型同时跑，按置信度择优——中文模型认英文天生比拉丁模型差一截。
+     *
+     * bmp 的所属权归这个方法：图是调用方交出来的（takePendingOcr / 裁剪），
+     * 两个模型都跑完就当场 recycle，不留给 GC 挑时候。放大版是新图，两张都要收。
      */
     private void runOcr(Bitmap bmp) {
-        dbPool.execute(() -> {
+        // 提交不进去（退出时线程池已收摊）就把图收掉：这张图的所属权在我手上，
+        // onDestroy 的 releasePendingOcr() 已经拿不到它了，不收就是 12~24MB 陪着进程走完。
+        submitDb("runOcr", () -> {
             final Bitmap img;
             try {
                 img = upscaleForOcr(bmp);
             } catch (Throwable t) {
+                recycleOcrPair(bmp, null);
                 runOnUiThread(() -> ocrText.setText("图片预处理失败：" + t.getMessage()));
                 return;
             }
@@ -2784,19 +3397,26 @@ public class MainActivity extends Activity {
             try {
                 tasks.add(getLatinRecognizer().process(InputImage.fromBitmap(img, 0)));
                 tags.add("英文模型");
-            } catch (Throwable ignored) {
-            }
+            } catch (Throwable ignored) { JLog.w("MainActivity.runOcr", ignored);
+             }
             try {
                 tasks.add(getRecognizer().process(InputImage.fromBitmap(img, 0)));
                 tags.add("中文模型");
-            } catch (Throwable ignored) {
-            }
+            } catch (Throwable ignored) { JLog.w("MainActivity.runOcr", ignored);
+             }
             if (tasks.isEmpty()) {
+                recycleOcrPair(bmp, img);
                 runOnUiThread(() -> ocrText.setText("识别服务未就绪，请重启 App 再试"));
                 return;
             }
+            // 完成回调也走同一道门：直接写 dbPool 的话，线程池收摊那一刻
+            // addOnCompleteListener 会把提交失败抛回调用线程，图就再没人收了。
+            java.util.concurrent.Executor ocrDone = body ->
+                    submitDb("ocrDone", body, () -> recycleOcrPair(bmp, img));
             com.google.android.gms.tasks.Tasks.whenAllComplete(tasks)
-                    .addOnCompleteListener(dbPool, task -> {
+                    .addOnCompleteListener(ocrDone, task -> {
+                        // 两个模型都到此为止，图没人再引用了，先放手再算结果
+                        recycleOcrPair(bmp, img);
                         Text best = null;
                         String which = "";
                         double bestScore = -1;
@@ -2840,7 +3460,7 @@ public class MainActivity extends Activity {
                             }
                         });
                     });
-        });
+        }, () -> recycleOcrPair(bmp, null));
     }
 
     /** 小图放大到长边约 1600px（最多 3 倍），字太小是识别不准的头号原因 */
@@ -2853,6 +3473,16 @@ public class MainActivity extends Activity {
         Bitmap out = Bitmap.createScaledBitmap(src, Math.max(1, Math.round(w * f)),
                 Math.max(1, Math.round(h * f)), true);
         return out == null ? src : out;
+    }
+
+    /**
+     * 回收识别用的图。放大常常就 multiply 出第二张全屏位图（1600px 见方 = 10MB），
+     * 原图 + 放大图一起压着，低配机上足够把堆顶穿，所以用完立刻收。
+     * createScaledBitmap 尺寸没变时会把原图原样返回，判一下别 recycle 两遍。
+     */
+    private static void recycleOcrPair(Bitmap src, Bitmap scaled) {
+        if (scaled != null && scaled != src && !scaled.isRecycled()) scaled.recycle();
+        if (src != null && !src.isRecycled()) src.recycle();
     }
 
     /** 给一份识别结果打分：平均置信度为主，乱码扣分，纯拉丁文本给拉丁模型加分 */
@@ -3041,8 +3671,8 @@ public class MainActivity extends Activity {
                                 ? Character.toUpperCase(best.charAt(0)) + best.substring(1) : best;
                     }
                 }
-            } catch (Throwable ignored) {
-            }
+            } catch (Throwable ignored) { JLog.w("MainActivity.polishOcr", ignored);
+             }
             out.append(fixed);
         }
         out.append(text, last, text.length());
@@ -3105,14 +3735,15 @@ public class MainActivity extends Activity {
             return;
         }
         final boolean zh2en = isChinese(input);
-        final String appId = prefs.getString("baidu_appid", "");
-        final String secret = prefs.getString("baidu_secret", "");
         translating = true;
-        if (!appId.isEmpty() && !secret.isEmpty()) {
-            // 云端优先：百度翻译；失败自动回退离线引擎，但错误原因必须显示出来
+        if (CloudTrans.isConfigured()) {
+            // 云端优先：当前选中的厂商（百度 / 腾讯云）；失败自动回退离线引擎，但错误原因必须显示出来
             translateOutput.setText(zh2en ? "（中 → 英 · 云端，翻译中…）" : "（英 → 中 · 云端，翻译中…）");
+            // onDestroy 把三个线程池都 shutdownNow 了，往收摊的池子提交是直接抛
+            // RejectedExecutionException = 主线程闪退。这里和素材下载那两处保持同一道检查。
+            if (netPool.isShutdown()) { translating = false; return; }
             netPool.execute(() -> {
-                final String result = baiduTranslate(input, zh2en, appId, secret);
+                final String result = CloudTrans.translate(input, zh2en);
                 runOnUiThread(() -> {
                     if (result == null) {
                         // 网络不通：静默回退离线（这时没有错误原因可显示）
@@ -3140,9 +3771,11 @@ public class MainActivity extends Activity {
     private void runOffline(final String input, final boolean zh2en) {
         Translator t = zh2en ? getZhEn() : getEnZh();
         final boolean[] finished = {false};
+        cancelTranslateWatchdog();
         // 30 秒无响应 → 判定卡住，给出自救指引并重建引擎
-        new android.os.Handler().postDelayed(() -> {
+        transWatchdog = () -> {
             if (!finished[0]) {
+                finished[0] = true;      // 之后迟到的回调就不再覆盖这段自救指引了
                 translating = false;
                 resetTranslators();
                 translateOutput.setText("引擎响应超时（30 秒）。\n\n可能原因与对策：\n"
@@ -3151,26 +3784,42 @@ public class MainActivity extends Activity {
                         + "3) 切换 Wi-Fi/流量后再试；\n"
                         + "4) 仍不行：设置 → 应用 → 简译 → 清除数据，重启 App（词典会自动重新解压）。");
             }
-        }, 30000);
+        };
+        // 挂在字段 handler 上：成功/失败/onDestroy 都要撤掉，
+        // 否则 lambda 会连着 Activity 和视图多存活 30 秒
+        transWatchdogHandler.postDelayed(transWatchdog, 30000);
         t.downloadModelIfNeeded()
                 .addOnSuccessListener(v -> t.translate(input)
                         .addOnSuccessListener(res -> {
+                            if (finished[0]) return;
                             finished[0] = true;
+                            cancelTranslateWatchdog();
                             translating = false;
                             translateOutput.setText((zh2en ? "（中 → 英）\n" : "（英 → 中）\n") + res);
                         })
                         .addOnFailureListener(e -> {
+                            if (finished[0]) return;
                             finished[0] = true;
+                            cancelTranslateWatchdog();
                             translating = false;
                             translateOutput.setText("翻译失败：" + friendly(e));
                         }))
                 .addOnFailureListener(e -> {
+                    if (finished[0]) return;
                     finished[0] = true;
+                    cancelTranslateWatchdog();
                     translating = false;
                     resetTranslators();
                     translateOutput.setText("语言包下载失败：" + friendly(e)
                             + "\n\n首次使用需联网下载一次语言包（约 30MB），请检查网络后重试；下载成功后即可永远离线使用。");
                 });
+    }
+
+    private void cancelTranslateWatchdog() {
+        if (transWatchdog != null) {
+            transWatchdogHandler.removeCallbacks(transWatchdog);
+            transWatchdog = null;
+        }
     }
 
     /** 关闭并清空引擎实例，让下一次点击用全新引擎重试 */
@@ -3185,115 +3834,106 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** 百度通用翻译 API；成功返回译文，失败返回 null（由调用方回退离线） */
-    private String baiduTranslate(String input, boolean zh2en, String appId, String secret) {
-        if (input.length() > 3000) {
-            return "!ERR:云端不支持超过 3000 字的段落，请分段翻译";
-        }
-        HttpURLConnection conn = null;
-        try {
-            String salt = String.valueOf(System.currentTimeMillis());
-            String sign = md5(appId + input + salt + secret);
-            String q = URLEncoder.encode(input, "UTF-8");
-            URL url = new URL("https://fanyi-api.baidu.com/api/trans/vip/translate"
-                    + "?q=" + q
-                    + "&from=" + (zh2en ? "zh" : "en")
-                    + "&to=" + (zh2en ? "en" : "zh")
-                    + "&appid=" + appId + "&salt=" + salt + "&sign=" + sign);
-            conn = (HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(5000);
-            conn.setReadTimeout(10000);
-            java.io.BufferedReader r = new java.io.BufferedReader(
-                    new java.io.InputStreamReader(conn.getInputStream(), "UTF-8"));
-            StringBuilder sb = new StringBuilder();
-            String line;
-            while ((line = r.readLine()) != null) sb.append(line);
-            r.close();
-            JSONObject o = new JSONObject(sb.toString());
-            if (o.has("error_code")) {
-                return "!ERR:" + baiduErrMsg(o.optString("error_code"), o.optString("error_msg"));
-            }
-            JSONArray arr = o.getJSONArray("trans_result");
-            StringBuilder out = new StringBuilder();
-            for (int i = 0; i < arr.length(); i++) {
-                if (i > 0) out.append('\n');
-                out.append(arr.getJSONObject(i).optString("dst"));
-            }
-            return out.toString();
-        } catch (Throwable t) {
-            return null;
-        } finally {
-            if (conn != null) conn.disconnect();
-        }
-    }
-
-    /** 百度错误码 → 人话 */
-    private static String baiduErrMsg(String code, String raw) {
-        if (code == null || code.isEmpty()) return "未知错误";
-        switch (code) {
-            case "52001": return "请求超时，请重试";
-            case "52002": return "百度服务系统错误，请稍后再试";
-            case "52003": return "APP ID 无效或未开通「通用翻译」服务";
-            case "54000": return "请求参数为空";
-            case "54001": return "签名错误：请检查 APP ID 和密钥是否填对（不要有多余空格）";
-            case "54003": return "请求太频繁：免费版限速 1 次/秒，请稍后再试";
-            case "54004": return "账户余额不足";
-            case "58002": return "服务已被封禁";
-            case "58003": return "本月免费额度已用完";
-            case "90107": return "账号未实名认证：请到百度智能云完成实名认证";
-            default: return "错误码 " + code + (raw == null || raw.isEmpty() ? "" : "（" + raw + "）");
-        }
-    }
-
-    private static String md5(String s) {
-        try {
-            MessageDigest md = MessageDigest.getInstance("MD5");
-            byte[] d = md.digest(s.getBytes("UTF-8"));
-            StringBuilder sb = new StringBuilder();
-            for (byte b : d) sb.append(String.format("%02x", b));
-            return sb.toString();
-        } catch (Exception e) {
-            return "";
-        }
-    }
-
-    /** 云端增强设置弹窗：填入百度翻译 API 的 APP ID 和密钥 */
+    /**
+     * 云端增强设置弹窗：可选百度 / 腾讯云，两家凭据分开存、互不影响。
+     * 切换厂商只改「用哪家」，之前填的另一边还留着，随时能切回来。
+     */
     private void showCloudDialog() {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
         int p = dp(20);
         box.setPadding(p, dp(8), p, 0);
+
+        // 厂商选择：两枚可点的标签，选中哪个就填哪个的凭据
+        LinearLayout provRow = new LinearLayout(this);
+        provRow.setOrientation(LinearLayout.HORIZONTAL);
+        final TextView[] provBtns = new TextView[2];
+        final String[] provIds = {CloudTrans.PROVIDER_BAIDU, CloudTrans.PROVIDER_TENCENT};
+        final String[] provNames = {"百度翻译", "腾讯云"};
+
+        // 凭据输入区：随厂商切换换内容
+        final LinearLayout credBox = new LinearLayout(this);
+        credBox.setOrientation(LinearLayout.VERTICAL);
         final EditText etId = new EditText(this);
-        etId.setHint("APP ID");
-        etId.setText(prefs.getString("baidu_appid", ""));
-        box.addView(etId);
         final EditText etKey = new EditText(this);
-        etKey.setHint("密钥");
-        etKey.setText(prefs.getString("baidu_secret", ""));
-        box.addView(etKey);
-        TextView tip = new TextView(this);
-        tip.setText("免费获取：fanyi-api.baidu.com → 注册 → 开通「通用翻译」。"
-                + "填入后联网翻译走云端（更通顺），断网自动切回离线引擎；每月免费额度约 5 万字符。");
+        final TextView tip = new TextView(this);
         tip.setTextColor(getColor(R.color.text_secondary));
         tip.setTextSize(13);
         tip.setPadding(0, dp(8), 0, 0);
-        box.addView(tip);
+        credBox.addView(etId);
+        credBox.addView(etKey);
+        credBox.addView(tip);
+
+        final Runnable[] fill = new Runnable[1];
+        fill[0] = () -> {
+            String prov = prefs.getString(CloudTrans.PREF_PROVIDER, CloudTrans.PROVIDER_BAIDU);
+            if (CloudTrans.PROVIDER_TENCENT.equals(prov)) {
+                etId.setHint("SecretId");
+                etId.setText(prefs.getString("tencent_secret_id", ""));
+                etKey.setHint("SecretKey");
+                etKey.setText(prefs.getString("tencent_secret_key", ""));
+                tip.setText("腾讯云机器翻译：控制台 → 访问管理 → API 密钥管理，新建一个密钥，"
+                        + "把 SecretId / SecretKey 填进来。需先开通「机器翻译」服务。"
+                        + "免费额度约每月 500 万字符，国内直连稳定。");
+            } else {
+                etId.setHint("APP ID");
+                etId.setText(prefs.getString("baidu_appid", ""));
+                etKey.setHint("密钥");
+                etKey.setText(prefs.getString("baidu_secret", ""));
+                tip.setText("免费获取：fanyi-api.baidu.com → 注册 → 开通「通用翻译」。"
+                        + "填入后联网翻译走云端（更通顺），断网自动切回离线引擎；每月免费额度约 5 万字符。");
+            }
+            for (int i = 0; i < provBtns.length; i++) {
+                boolean sel = provIds[i].equals(prov);
+                provBtns[i].setTextColor(getColor(sel ? R.color.text_primary : R.color.text_secondary));
+                provBtns[i].setBackgroundResource(sel ? R.drawable.btn_soft : R.drawable.input_bg);
+            }
+        };
+
+        for (int i = 0; i < 2; i++) {
+            final int idx = i;
+            TextView b = new TextView(this);
+            b.setText(provNames[i]);
+            b.setTextSize(15);
+            b.setPadding(dp(14), dp(9), dp(14), dp(9));
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            lp.rightMargin = dp(10);
+            b.setLayoutParams(lp);
+            b.setOnClickListener(v -> {
+                prefs.edit().putString(CloudTrans.PREF_PROVIDER, provIds[idx]).apply();
+                fill[0].run();
+            });
+            provBtns[i] = b;
+            provRow.addView(b);
+        }
+        box.addView(provRow);
+        box.addView(credBox);
+        fill[0].run();      // 用当前厂商填初值
 
         new AlertDialog.Builder(this)
                 .setTitle("云端增强")
                 .setView(box)
                 .setPositiveButton("保存并测试", (d, w) -> {
+                    final String prov = prefs.getString(CloudTrans.PREF_PROVIDER, CloudTrans.PROVIDER_BAIDU);
                     final String id = etId.getText().toString().trim();
                     final String key = etKey.getText().toString().trim();
-                    prefs.edit().putString("baidu_appid", id).putString("baidu_secret", key).apply();
+                    if (CloudTrans.PROVIDER_TENCENT.equals(prov)) {
+                        prefs.edit().putString("tencent_secret_id", id)
+                                .putString("tencent_secret_key", key).apply();
+                    } else {
+                        prefs.edit().putString("baidu_appid", id)
+                                .putString("baidu_secret", key).apply();
+                    }
                     refreshCloudLabel();
                     if (id.isEmpty() || key.isEmpty()) {
                         Toast.makeText(this, "已停用云端（信息为空）", Toast.LENGTH_SHORT).show();
                         return;
                     }
                     Toast.makeText(this, "已保存，正在测试连通…", Toast.LENGTH_SHORT).show();
+                    if (netPool.isShutdown()) return;
                     netPool.execute(() -> {
-                        final String r = baiduTranslate("你好，世界", true, id, key);
+                        final String r = CloudTrans.translate("你好，世界", true);
                         runOnUiThread(() -> {
                             if (r != null && !r.startsWith("!ERR:")) {
                                 Toast.makeText(this, "云端连通成功 ✓（返回：" + r + "）", Toast.LENGTH_LONG).show();
@@ -3304,7 +3944,13 @@ public class MainActivity extends Activity {
                     });
                 })
                 .setNeutralButton("停用", (d, w) -> {
-                    prefs.edit().remove("baidu_appid").remove("baidu_secret").apply();
+                    // 只停用当前厂商的凭据，另一家留着
+                    String prov = prefs.getString(CloudTrans.PREF_PROVIDER, CloudTrans.PROVIDER_BAIDU);
+                    if (CloudTrans.PROVIDER_TENCENT.equals(prov)) {
+                        prefs.edit().remove("tencent_secret_id").remove("tencent_secret_key").apply();
+                    } else {
+                        prefs.edit().remove("baidu_appid").remove("baidu_secret").apply();
+                    }
                     refreshCloudLabel();
                 })
                 .setNegativeButton("取消", null)
@@ -3312,8 +3958,10 @@ public class MainActivity extends Activity {
     }
 
     private void refreshCloudLabel() {
-        boolean on = !prefs.getString("baidu_appid", "").isEmpty();
-        cloudToggle.setText(on ? "云端增强：已开启" : "云端增强：未开启");
+        boolean on = CloudTrans.isConfigured();
+        cloudToggle.setText(on
+                ? "云端增强：" + CloudTrans.providerLabel() + "已开启"
+                : "云端增强：未开启");
         cloudToggle.setTextColor(getColor(on ? R.color.text_primary : R.color.text_secondary));
     }
 
@@ -3348,6 +3996,40 @@ public class MainActivity extends Activity {
         return translatorEnZh;
     }
 
+    /**
+     * 旋转 / 分屏：manifest 里用 configChanges 接管了，Activity 不重建、词典不重载（#11）。
+     * 系统仍会重新测量布局，但有几件事必须手动做：
+     *  ① 按尺寸自绘的页面（游戏）要能重新铺开并恢复重绘；
+     *  ② 清掉查词框的焦点，否则旋转/恢复瞬间系统会自作主张把输入法弹出来（#6）。
+     */
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        // 布局尺寸变了，让游戏页按新尺寸重铺一屏；非游戏页也会重走测量，这里只兜底游戏
+        if (gameView != null && isPageVisible(pageGame)) {
+            gameView.requestLayout();
+            gameView.invalidate();
+        }
+        // 关键：交出查词框焦点 + 收键盘，避免配置一变就自动呼出输入法
+        hideKeyboard();
+    }
+
+    /**
+     * 从桌面切回前台时触发（#6）。
+     * 之前完全没有这个回调，导致「游戏时切后台再回来，小屏机会自动呼出键盘」——
+     * 因为 searchBox 可能还留着焦点，系统一看有可获焦点的输入框就把 IME 拉起来。
+     * 这里只要不在查词页，就把焦点和键盘都收干净。
+     */
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // 只有停在游戏页（或其它非查词页）才收；停在查词页时不动，
+        // 否则会打断用户正在输入的词。
+        if (pageGame != null && pageGame.getVisibility() == View.VISIBLE) {
+            hideKeyboard();
+        }
+    }
+
     @Override
     protected void onPause() {
         super.onPause();
@@ -3368,14 +4050,41 @@ public class MainActivity extends Activity {
             skinBmp.recycle();
             skinBmp = null;
         }
+        releasePendingOcr();        // 停在框选页直接退出的话，那张相机图还压在字段上
         if (pron != null) pron.release();
         releaseListen();
         if (translatorZhEn != null) translatorZhEn.close();
         if (translatorEnZh != null) translatorEnZh.close();
         if (recognizer != null) recognizer.close();
         if (latinRecognizer != null) latinRecognizer.close();
-        dbPool.shutdown();
-        netPool.shutdown();
+        suggestHandler.removeCallbacksAndMessages(null);       // 撤掉还在防抖窗口里等着的联想查询
+        flushPendingStudyWrites();                            // 排在 dbPool 里的答题落库先补做完，下面的 shutdownNow 会整队丢掉它们
+        // shutdownNow：shutdown() 会让排队的任务继续跑完，那些任务都会 runOnUiThread/Toast，
+        // Activity 都没了还往它投递工作 = 泄漏 + 销毁后访问视图
+        dbPool.shutdownNow();
+        netPool.shutdownNow();
+        packPool.shutdownNow();
+        // studyDb 得等 dbPool 收摊再关：那条线上可能还压着一个没跑完的写库，
+        // 先关就是 "database has been closed"。给一点点耐心，别无限等。
+        try {
+            dbPool.awaitTermination(1500, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        if (studyDb != null) {
+            studyDb.close();
+            studyDb = null;
+        }
+        dictStatusHandler.removeCallbacksAndMessages(null);   // 撤掉没触发的延迟提示，防泄漏
+        cancelTranslateWatchdog();                            // 撤掉翻译超时看门狗（它持有本 Activity 和视图）
+        if (studyPanelDialog != null) {                       // Dialog 不关就是 window leak
+            studyPanelDialog.dismiss();
+            studyPanelDialog = null;
+        }
+        if (dict != null) {                                   // 只读词典句柄也得还，进程活着就一直占着 fd
+            dict.close();
+            dict = null;
+        }
         super.onDestroy();
     }
 
@@ -3397,6 +4106,7 @@ public class MainActivity extends Activity {
      * 系统也就不会再弹键盘（这就是"查完下一个要点两下"的根因）。
      */
     private void hideKeyboard() {
+        if (searchBox == null) return;      // onResume/旋屏可能早于 onCreate 完成赋值
         InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
         if (imm != null) imm.hideSoftInputFromWindow(searchBox.getWindowToken(), 0);
         searchBox.clearFocus();
@@ -3462,8 +4172,26 @@ public class MainActivity extends Activity {
             Toast.makeText(MainActivity.this, "发音失败：" + message, Toast.LENGTH_LONG).show();
         } else if (state == Pron.STATE_OFFLINE) {
             Toast.makeText(MainActivity.this, "离线中，已用手机自带语音朗读", Toast.LENGTH_SHORT).show();
+        } else if (state == Pron.STATE_NO_ENGINE && message != null) {
+            // 本机没有任何可用的英文语音（#10 旧手机离线朗读用不了的真正原因）。
+            // 静默失败只会让人以为 App 坏了，给一个能照着做的引导。
+            showNoTtsEngineDialog(message);
         }
     };
+
+    /** 无英文语音引擎时的引导（#10）：告诉用户两条可走的路 */
+    private void showNoTtsEngineDialog(String detail) {
+        if (isFinishing()) return;
+        new AlertDialog.Builder(this)
+                .setTitle("这台手机没法离线朗读")
+                .setMessage(detail
+                        + "\n\n两条解决办法：\n"
+                        + "① 联网时打开「设置 → 发音 → 预缓存常用词」，把发音存到本地，之后断网也能听；\n"
+                        + "② 或者在系统「文字转语音」里安装/启用英文语音包。")
+                .setPositiveButton("去预缓存", (d, w) -> showSettings())
+                .setNegativeButton("知道了", null)
+                .show();
+    }
 
     /** 结果卡片右侧的喇叭：灰=可播，半透明=加载中，变深=播放中 */
     private View buildSpeaker(final DictDb.Entry e) {
@@ -3521,6 +4249,58 @@ public class MainActivity extends Activity {
             zh.setPadding(0, dp(3), 0, 0);
             wrap.addView(zh);
         }
+        return wrap;
+    }
+
+    /**
+     * 常用搭配一行（v3.10 词组训练 A）：
+     * 上面是英文短语（可点、点了就查这个短语），右边一个喇叭能听发音；
+     * 下面是中文释义。整块包一层可点击背景。
+     */
+    private View buildPhraseRow(final DictDb.Phrase x) {
+        LinearLayout wrap = new LinearLayout(this);
+        wrap.setOrientation(LinearLayout.VERTICAL);
+        wrap.setPadding(0, dp(8), 0, 0);
+        wrap.setBackgroundResource(R.drawable.input_bg);   // 浅底块，和其它内容区分开
+        int pad = dp(10);
+        wrap.setPadding(pad, pad, pad, pad);
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+
+        TextView en = new TextView(this);
+        en.setText(x.phrase);
+        en.setTextColor(getColor(R.color.text_primary));
+        en.setTextSize(15);
+        en.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        en.setLineSpacing(dp(2), 1);
+        en.setLayoutParams(new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+        row.addView(en);
+        row.addView(buildSpeakerFor(x.phrase, dp(34)));
+        wrap.addView(row);
+
+        if (x.zh != null && !x.zh.isEmpty()) {
+            TextView zh = new TextView(this);
+            zh.setText(x.zh);
+            zh.setTextColor(getColor(R.color.text_secondary));
+            zh.setTextSize(14);
+            zh.setLineSpacing(dp(2), 1);
+            zh.setPadding(0, dp(3), 0, 0);
+            wrap.addView(zh);
+        }
+
+        // 点英文短语 → 直接查这个短语（短语本身在词典里也有词条）
+        en.setOnClickListener(v -> {
+            searchBox.setText(x.phrase);
+            searchBox.setSelection(x.phrase.length());
+            doLookup(x.phrase);
+        });
+        wrap.setOnClickListener(v -> {
+            searchBox.setText(x.phrase);
+            searchBox.setSelection(x.phrase.length());
+            doLookup(x.phrase);
+        });
         return wrap;
     }
 
@@ -3810,12 +4590,13 @@ public class MainActivity extends Activity {
 
     /** 把选中的图按屏幕比例居中裁剪、压到屏幕尺寸内，存成皮肤文件 */
     private boolean saveSkinBitmap(Uri uri) {
+        Bitmap cropped = null;
         try {
             BitmapFactory.Options probe = new BitmapFactory.Options();
             probe.inJustDecodeBounds = true;
-            InputStream s = getContentResolver().openInputStream(uri);
-            BitmapFactory.decodeStream(s, null, probe);
-            if (s != null) s.close();
+            try (InputStream s = getContentResolver().openInputStream(uri)) {
+                BitmapFactory.decodeStream(s, null, probe);
+            }
 
             int vw = getResources().getDisplayMetrics().widthPixels;
             int vh = getResources().getDisplayMetrics().heightPixels;
@@ -3825,15 +4606,15 @@ public class MainActivity extends Activity {
             }
             BitmapFactory.Options opts = new BitmapFactory.Options();
             opts.inSampleSize = sample;
-            InputStream s2 = getContentResolver().openInputStream(uri);
-            Bitmap src = BitmapFactory.decodeStream(s2, null, opts);
-            if (s2 != null) s2.close();
+            Bitmap src;
+            try (InputStream s2 = getContentResolver().openInputStream(uri)) {
+                src = BitmapFactory.decodeStream(s2, null, opts);
+            }
             if (src == null) return false;
 
             // 居中裁剪成屏幕比例，铺满时才不变形
             float screenRatio = (float) vw / vh;
             float imgRatio = (float) src.getWidth() / src.getHeight();
-            Bitmap cropped;
             if (imgRatio > screenRatio) {
                 int w = Math.round(src.getHeight() * screenRatio);
                 int x = (src.getWidth() - w) / 2;
@@ -3846,19 +4627,38 @@ public class MainActivity extends Activity {
             if (cropped != src) src.recycle();
 
             File out = new File(getFilesDir(), "skin.jpg");
-            FileOutputStream fo = new FileOutputStream(out);
-            cropped.compress(Bitmap.CompressFormat.JPEG, 85, fo);
-            fo.close();
-            cropped.recycle();
-
-            // 换图后旧缓存作废
-            if (skinBmp != null) {
-                skinBmp.recycle();
-                skinBmp = null;
+            // 先写临时文件，成功后再替换，避免压缩中途失败把老皮肤写成半截文件
+            File tmp = new File(getFilesDir(), "skin.jpg.tmp");
+            boolean compressed;
+            try (FileOutputStream fo = new FileOutputStream(tmp)) {
+                compressed = cropped.compress(Bitmap.CompressFormat.JPEG, 85, fo);
             }
+            if (!compressed) {
+                tmp.delete();
+                return false;
+            }
+            File old = new File(getFilesDir(), "skin.jpg");
+            if (old.exists() && !old.delete()) {
+                tmp.delete();
+                return false;
+            }
+            if (!tmp.renameTo(out)) {
+                tmp.delete();
+                return false;
+            }
+
+            // 旧缓存直接放手，别在这儿 recycle：这个方法是后台线程跑的，
+            // 而 skinBmp 还挂在屏幕背景的 BitmapDrawable 上，界面正画到一半，
+            // 回收中的位图被画布碰到就是 "Canvas: trying to use a recycled bitmap"。
+            // API 26 起位图像素本来就在 Java 堆里，交给 GC 收就够了，
+            // 调用方紧接着会 applySkin() 解出新图，老的这张再没人引用自然会被回收。
+            skinBmp = null;
             return true;
         } catch (Throwable t) {
+            JLog.w("MainActivity.saveSkinBitmap", t);
             return false;
+        } finally {
+            if (cropped != null) cropped.recycle();
         }
     }
 
@@ -3880,7 +4680,22 @@ public class MainActivity extends Activity {
         if (skinBmp != null) return skinBmp;
         File f = new File(getFilesDir(), "skin.jpg");
         if (!f.exists() || f.length() == 0) return null;
-        skinBmp = BitmapFactory.decodeFile(f.getPath());
+        // 皮肤是按屏幕比例存的，但存的时候只限到「每边不超过 2 倍屏幕」，
+        // 1080×2400 的机器上文件就可能还是 2160×4800。默认参数解出来是 ARGB_8888，
+        // 那张图会一直压在 skinBmp 字段里当全 App 背景 —— 10.4M 像素 × 4 字节 ≈ 41MB。
+        // 背景最终就是铺满屏幕，解到屏幕尺寸 + RGB_565 完全够，看着没差别，留 5MB 左右。
+        BitmapFactory.Options probe = new BitmapFactory.Options();
+        probe.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(f.getPath(), probe);
+        if (probe.outWidth <= 0 || probe.outHeight <= 0) return null;
+        int vw = getResources().getDisplayMetrics().widthPixels;
+        int vh = getResources().getDisplayMetrics().heightPixels;
+        BitmapFactory.Options opts = new BitmapFactory.Options();
+        opts.inPreferredConfig = Bitmap.Config.RGB_565;
+        int sample = 1;
+        while (probe.outWidth / sample > vw || probe.outHeight / sample > vh) sample *= 2;
+        opts.inSampleSize = sample;
+        skinBmp = BitmapFactory.decodeFile(f.getPath(), opts);
         return skinBmp;
     }
 
@@ -3970,6 +4785,95 @@ public class MainActivity extends Activity {
         cacheNote.setTextSize(11);
         cacheNote.setPadding(0, dp(4), 0, 0);
         box.addView(cacheNote);
+
+        // ===== 词组训练（v3.10）=====
+        box.addView(sectionTitle("词组训练"));
+        TextView phraseInfo = new TextView(this);
+        phraseInfo.setTextColor(getColor(R.color.text_secondary));
+        phraseInfo.setTextSize(13);
+        final int pc = (dictReady && dict != null) ? dict.phraseCount() : 0;
+        phraseInfo.setText(pc > 0
+                ? "已收录 " + pc + " 条常用搭配（give up / take over / work out…）"
+                : "搭配库正在加载，或本机词典还是旧版（升级后会自动更新一次）");
+        phraseInfo.setPadding(0, dp(4), 0, dp(4));
+        box.addView(phraseInfo);
+
+        TextView phraseNote = new TextView(this);
+        phraseNote.setText("查词时，词条下方会列出这个字的常用搭配；"
+                + "记背页每组也会出 2 道短语题（给中文选英文搭配 / 给英文搭配选中文）。");
+        phraseNote.setTextColor(getColor(R.color.text_secondary));
+        phraseNote.setTextSize(11);
+        phraseNote.setPadding(0, dp(4), 0, 0);
+        box.addView(phraseNote);
+
+        // ===== 错词复现（#8）：把两条复现路径讲清楚，别让人以为错词丢了 =====
+        box.addView(sectionTitle("错词复现"));
+        TextView wrongInfo = new TextView(this);
+        wrongInfo.setText("错过的词会自己回来，走两条路：");
+        wrongInfo.setTextColor(getColor(R.color.text_secondary));
+        wrongInfo.setTextSize(13);
+        wrongInfo.setPadding(0, dp(4), 0, dp(2));
+        box.addView(wrongInfo);
+
+        TextView wrongNote = new TextView(this);
+        wrongNote.setText("① 记背页：答错的词按「1 天 → 2 天 → 4 天 → 8 天 → 16 天」阶梯安排复习，"
+                + "答对一次就往后挪一格，所以当天再练一组看不到它——要等到期。\n"
+                + "② 配对游戏：配错的词过 3 屏（约 15 对）后会回到牌桌上，帮你再认一遍。\n"
+                + "③ 两条路都算「答错过」，所以游戏里配错的词也会进「错题集」。");
+        wrongNote.setTextColor(getColor(R.color.text_secondary));
+        wrongNote.setTextSize(11);
+        wrongNote.setLineSpacing(dp(3), 1);
+        wrongNote.setPadding(0, dp(2), 0, 0);
+        box.addView(wrongNote);
+
+        // ===== 消除音效（v3.12）=====
+        box.addView(sectionTitle("音效"));
+        final TextView sfxRow = optionRow("", () -> { });
+        final Runnable refreshSfx = () -> {
+            boolean on = prefs.getBoolean("game_sfx", true);
+            sfxRow.setText("配对消除音效：" + (on ? "开" : "关"));
+            sfxRow.setTextColor(getColor(on ? R.color.text_primary : R.color.text_secondary));
+        };
+        sfxRow.setOnClickListener(v -> {
+            boolean on = !prefs.getBoolean("game_sfx", true);
+            prefs.edit().putBoolean("game_sfx", on).apply();
+            if (gameView != null) gameView.setSfxEnabled(on);
+            refreshSfx.run();
+            // 开着的话当场播一记，让你立刻听到效果
+            if (on && gameView != null) gameView.previewSfx();
+        });
+        refreshSfx.run();
+        box.addView(sfxRow);
+
+        TextView sfxNote = new TextView(this);
+        sfxNote.setText("游戏里配对消除时会「啵」一声；连着消多个时音高会微变，不容易听腻。");
+        sfxNote.setTextColor(getColor(R.color.text_secondary));
+        sfxNote.setTextSize(11);
+        sfxNote.setPadding(0, dp(4), 0, 0);
+        box.addView(sfxNote);
+
+        final TextView vibeRow = optionRow("", () -> { });
+        final Runnable refreshVibe = () -> {
+            boolean on = prefs.getBoolean("game_vibe", true);
+            vibeRow.setText("选错震动提醒：" + (on ? "开" : "关"));
+            vibeRow.setTextColor(getColor(on ? R.color.text_primary : R.color.text_secondary));
+        };
+        vibeRow.setOnClickListener(v -> {
+            boolean on = !prefs.getBoolean("game_vibe", true);
+            prefs.edit().putBoolean("game_vibe", on).apply();
+            if (gameView != null) gameView.setVibeEnabled(on);
+            refreshVibe.run();
+            if (on && gameView != null) gameView.previewBuzz();
+        });
+        refreshVibe.run();
+        box.addView(vibeRow);
+
+        TextView vibeNote = new TextView(this);
+        vibeNote.setText("配对选错时短促震一下，手机没有马达则自动略过。");
+        vibeNote.setTextColor(getColor(R.color.text_secondary));
+        vibeNote.setTextSize(11);
+        vibeNote.setPadding(0, dp(4), 0, 0);
+        box.addView(vibeNote);
 
         box.addView(sectionTitle("素材包"));
         final TextView packRow = optionRow("", () -> { });
@@ -4228,6 +5132,11 @@ public class MainActivity extends Activity {
             marks.setOrientation(LinearLayout.HORIZONTAL);
             marks.setGravity(Gravity.CENTER_VERTICAL);
             int markCount = 0;
+            if (e.phrase) {
+                // 词组释义来自搭配表，挂个标签说明出处，免得看着像缺音标缺词性的残条目
+                marks.addView(chip("词组 · 常见搭配", R.color.text_secondary));
+                markCount++;
+            }
             if (hasTag(e, "cet6")) {
                 marks.addView(chip("六级重点", R.color.mark_cet6));
                 markCount++;
@@ -4270,6 +5179,17 @@ public class MainActivity extends Activity {
                 tr.setLineSpacing(dp(4), 1);
                 tr.setPadding(0, dp(14), 0, 0);
                 box.addView(tr);
+            }
+
+            // ===== 常用搭配（v3.10 词组训练 A）：紧跟释义，讲"这个词怎么用" =====
+            if (it.phrases != null && !it.phrases.isEmpty()) {
+                TextView ph = new TextView(MainActivity.this);
+                ph.setText("常用搭配");
+                ph.setTextColor(getColor(R.color.text_secondary));
+                ph.setTextSize(13);
+                ph.setPadding(0, dp(18), 0, 0);
+                box.addView(ph);
+                for (DictDb.Phrase x : it.phrases) box.addView(buildPhraseRow(x));
             }
 
             // ===== 例句（紧跟中文释义，便于对照记忆） =====

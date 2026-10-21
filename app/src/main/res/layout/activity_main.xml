@@ -191,6 +191,20 @@
             android:layout_height="match_parent"
             android:orientation="vertical">
 
+            <!-- 词典准备中提示：一行灰色小字，不占列表区。
+                 解压快的话 3 秒内就消失了，用户基本注意不到；
+                 慢设备上还能看出 App 在忙，不至于以为卡死。默认 GONE。 -->
+            <TextView
+                android:id="@+id/dictStatus"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textSize="12sp"
+                android:textColor="@color/text_secondary"
+                android:gravity="center"
+                android:paddingTop="10dp"
+                android:paddingBottom="2dp"
+                android:visibility="gone" />
+
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -399,20 +413,46 @@
             android:clickable="true"
             android:visibility="gone">
 
-            <TextView
-                android:id="@+id/btnClearHistory"
-                android:layout_width="wrap_content"
+            <LinearLayout
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="@string/clear_history"
-                android:textColor="@color/text_secondary"
-                android:textSize="14sp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
                 android:layout_marginStart="20dp"
                 android:layout_marginTop="12dp"
-                android:paddingStart="12dp"
-                android:paddingEnd="12dp"
-                android:paddingTop="6dp"
-                android:paddingBottom="6dp"
-                android:background="@drawable/input_bg" />
+                android:layout_marginEnd="20dp">
+
+                <TextView
+                    android:id="@+id/historyBack"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/back"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="15sp"
+                    android:paddingStart="12dp"
+                    android:paddingEnd="12dp"
+                    android:paddingTop="6dp"
+                    android:paddingBottom="6dp"
+                    android:background="@drawable/input_bg" />
+
+                <View
+                    android:layout_width="0dp"
+                    android:layout_height="1dp"
+                    android:layout_weight="1" />
+
+                <TextView
+                    android:id="@+id/btnClearHistory"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/clear_history"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="14sp"
+                    android:paddingStart="12dp"
+                    android:paddingEnd="12dp"
+                    android:paddingTop="6dp"
+                    android:paddingBottom="6dp"
+                    android:background="@drawable/input_bg" />
+            </LinearLayout>
 
             <TextView
                 android:id="@+id/historyEmpty"

@@ -1,11 +1,18 @@
 package com.jianyi.dict;
 
 import android.content.Context;
+import android.content.res.AssetFileDescriptor;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.RectF;
 import android.graphics.Typeface;
+import android.media.AudioAttributes;
+import android.media.SoundPool;
+import android.os.Build;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
+import android.os.VibratorManager;
 import android.view.MotionEvent;
 import android.view.View;
 
@@ -145,6 +152,23 @@ public class MatchGameView extends View {
     private boolean exhausted;         // 词典里能出的词都出完了
     private int lastMode = -1;         // 上一屏的图案，避免连着两次一样
 
+    // ===== 消除音效（解压气泡）=====
+    // 用 SoundPool 而不是 MediaPlayer：消除音只有 85ms，MediaPool 每次都要
+    // prepare + seek，几百毫秒的延迟会让"点了没声"；SoundPool 常驻内存、即时出声。
+    // 每次播放随机微调音高（0.94~1.06），连着消好几个时不至于像复读机。
+    private SoundPool soundPool;
+    private int popSoundId = -1;
+    private AssetFileDescriptor sfxFd;    // SoundPool 不负责关它，见 releaseSfx
+    private boolean sfxEnabled = true;
+    private boolean sfxReady;         // SoundPool 是异步解码，装完才能响
+    private boolean playOnReady;      // 没装完就有人要听，装完补放一记
+    private final Random sfxRnd = new Random();
+
+    // 选错震动：短促一下（30ms）当"答错"提醒。震动器初始化慢且吃资源，
+    // 用到才建、离开页面就放；没有马达的老手机直接跳过，不报错。
+    private Vibrator vibrator;
+    private boolean vibeEnabled = true;
+
     // 重绘循环
     private boolean looping;
     private long lastFrameNs;
@@ -162,6 +186,9 @@ public class MatchGameView extends View {
     private final Paint tabPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final RectF rect = new RectF();
     private final RectF bar = new RectF();
+    // 每个方块每帧都要问一次字号基线，无参的 getFontMetrics() 每次都 new 一个对象；
+    // 复用这一个，省掉 60fps 下几百个/秒的垃圾。
+    private final Paint.FontMetrics fontMetrics = new Paint.FontMetrics();
 
     // 颜色（跟随日夜主题，attach 时刷新）
     private int cSurface, cStroke, cText, cTextSec, cAccent, cAccentSoft, cPeach, cMark, cCet6;
@@ -192,6 +219,187 @@ public class MatchGameView extends View {
     protected void onAttachedToWindow() {
         super.onAttachedToWindow();
         refreshColors();      // 换肤色后重建视图，这里拿到的是新主题
+        loadSfx();
+        loadVibrator();
+    }
+
+    @Override
+    protected void onDetachedFromWindow() {
+        releaseSfx();
+        releaseVibrator();
+        super.onDetachedFromWindow();
+    }
+
+    // ================= 消除音效 =================
+
+    /** 首次挂载时把音效装进 SoundPool；装失败不影响游戏，静默跳过 */
+    private void loadSfx() {
+        if (soundPool != null || !sfxEnabled) return;
+        try {
+            AudioAttributes attrs = new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_GAME)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build();
+            soundPool = new SoundPool.Builder()
+                    .setMaxStreams(3)          // 同时最多 3 个，够连消用
+                    .setAudioAttributes(attrs)
+                    .build();
+            soundPool.setOnLoadCompleteListener((sp, id, status) -> {
+                if (soundPool == null) return;   // 已经释放过：这记是迟到的回调，别反手把开关关掉
+                if (status == 0 && id == popSoundId) {
+                    sfxReady = true;
+                    // 解码是异步的：设置里刚把开关打开就试听、或进游戏第一对就消除，
+                    // 都可能撞上"还没装完"。这里补放一记，别让人以为又是静音。
+                    if (playOnReady) {
+                        playOnReady = false;
+                        playPop();
+                    }
+                } else {
+                    // 加载失败（文件损坏/格式不支持）：关掉音效，别每帧重试
+                    sfxEnabled = false;
+                    sfxReady = false;
+                    popSoundId = -1;
+                }
+            });
+            // pop.wav 打包在 APK 的 assets/ 下，磁盘上没有这个文件，所以 load(String,int)
+            // （收文件系统绝对路径）会直接失败；android-34 也没有 load(AssetManager,String,int)
+            // 这个重载。唯一可行的入口是 openFd 拿 AssetFileDescriptor 再 load。
+            // 老写法每次都返回 0 → 开关写着"开"却永远不出声。
+            sfxFd = getContext().getAssets().openFd("sfx/pop.wav");
+            popSoundId = soundPool.load(sfxFd, 1);
+            if (popSoundId == 0) {
+                // 连 id 都没拿到（ SoundPool 拒绝了这个 fd），回调也不会来，当场判定失败
+                sfxEnabled = false;
+                releaseSfx();
+            }
+        } catch (Throwable t) {
+            JLog.w("MatchGameView.loadSfx", t);
+            sfxEnabled = false;
+            sfxReady = false;
+            popSoundId = -1;
+        }
+    }
+
+    /** 离开页面时释放 SoundPool，避免 native 内存泄漏（低配机尤其重要） */
+    private void releaseSfx() {
+        if (soundPool != null) {
+            try {
+                soundPool.release();
+            } catch (Throwable ignored) { JLog.w("MatchGameView.releaseSfx", ignored);
+             }
+            soundPool = null;
+        }
+        popSoundId = -1;
+        sfxReady = false;
+        playOnReady = false;
+        // SoundPool.release() 不负责关我们传进去的 fd，得自己收。
+        if (sfxFd != null) {
+            try {
+                sfxFd.close();
+            } catch (Throwable ignored) { JLog.w("MatchGameView.closeSfxFd", ignored);
+            }
+            sfxFd = null;
+        }
+    }
+
+    /** 设置里开关音效；重新打开时需要重新 load（之前可能已释放） */
+    public void setSfxEnabled(boolean on) {
+        sfxEnabled = on;
+        if (on) {
+            // 之前那次 load 失败时 soundPool 还在（只是没装进声音），
+            // 不释放就直接 return，开关永远装不上第二遍。
+            if (!sfxReady && soundPool != null) releaseSfx();
+            loadSfx();
+        } else {
+            releaseSfx();
+        }
+    }
+
+    /** 放一记消除音；带随机音高，避免连续消时听着像复读 */
+    private void playPop() {
+        if (!sfxEnabled || !sfxReady || soundPool == null) return;
+        try {
+            float rate = 0.94f + sfxRnd.nextFloat() * 0.12f;   // 0.94 ~ 1.06
+            soundPool.play(popSoundId, 1f, 1f, 1, 0, rate);
+        } catch (Throwable ignored) { JLog.w("MatchGameView.playPop", ignored);
+         }
+    }
+
+    /** 设置里打开开关时试听一记（即使不在游戏页也能出声） */
+    public void previewSfx() {
+        loadSfx();
+        if (!sfxReady) {
+            playOnReady = true;      // 装完自动补放，见 onLoadComplete
+            return;
+        }
+        playPop();
+    }
+
+    // ================= 选错震动 =================
+
+    /** 取系统震动器；Android 12 起要通过 VibratorManager 拿。取不到就当没马达。 */
+    private void loadVibrator() {
+        if (vibrator != null || !vibeEnabled) return;
+        try {
+            Context ctx = getContext();
+            if (ctx == null) return;
+            Vibrator v;
+            if (Build.VERSION.SDK_INT >= 31) {
+                VibratorManager vm = (VibratorManager) ctx.getSystemService(Context.VIBRATOR_MANAGER_SERVICE);
+                v = vm == null ? null : vm.getDefaultVibrator();
+            } else {
+                v = (Vibrator) ctx.getSystemService(Context.VIBRATOR_SERVICE);
+            }
+            // 有些设备（平板、部分国产机）根本没有马达，hasVibrator() 为 false，直接不用
+            if (v != null && v.hasVibrator()) {
+                vibrator = v;
+            } else {
+                vibeEnabled = false;
+            }
+        } catch (Throwable ignored) {
+            vibeEnabled = false;
+        }
+    }
+
+    private void releaseVibrator() {
+        if (vibrator != null) {
+            try {
+                vibrator.cancel();
+            } catch (Throwable ignored) { JLog.w("MatchGameView.releaseVibrator", ignored);
+             }
+        }
+        vibrator = null;
+    }
+
+    /** 短促震一下表示"选错了"。30ms 是能感觉到又不打断节奏的短度。 */
+    private void playWrongBuzz() {
+        if (!vibeEnabled || vibrator == null) return;
+        try {
+            if (Build.VERSION.SDK_INT >= 26) {
+                // 振幅 128（约一半力度），别震得太粗暴
+                vibrator.vibrate(VibrationEffect.createOneShot(30, 128));
+            } else {
+                // Android 7.x（API 24-25）没有 VibrationEffect，用老的时长参数
+                vibrator.vibrate(30);
+            }
+        } catch (Throwable ignored) { JLog.w("MatchGameView.playWrongBuzz", ignored);
+         }
+    }
+
+    /** 设置里开关震动 */
+    public void setVibeEnabled(boolean on) {
+        vibeEnabled = on;
+        if (on) {
+            loadVibrator();
+        } else {
+            releaseVibrator();
+        }
+    }
+
+    /** 设置里打开震动开关时当场试一下 */
+    public void previewBuzz() {
+        loadVibrator();
+        playWrongBuzz();
     }
 
     private void refreshColors() {
@@ -279,14 +487,6 @@ public class MatchGameView extends View {
             lastFrameNs = System.nanoTime();
             ensureLoop();
         }
-    }
-
-    public int getScore() {
-        return score;
-    }
-
-    public int getBest() {
-        return best;
     }
 
     // ================= 开局 / 铺牌 =================
@@ -680,6 +880,7 @@ public class MatchGameView extends View {
             hit.dying = true;
             burst(a);
             burst(hit);
+            playPop();                    // 配对成功的「啵」一声
             combo++;
             // 连击倍数：连对第 1 把 +10，第 2 把 +20 …… 封顶 ×5（+50）
             int gain = 10 * Math.min(5, combo);
@@ -694,6 +895,7 @@ public class MatchGameView extends View {
             combo = 0;
             // 错一次抵掉一次基础配对；连击清零是更重的代价
             score = Math.max(0, score - 10);
+            playWrongBuzz();                            // 选错：短促震一下提醒
             // 这两块都算"没认出来"：三屏之后各回来一次，帮玩家再认一遍
             rememberWrong(a.pair);
             rememberWrong(hit.pair);
@@ -979,8 +1181,8 @@ public class MatchGameView extends View {
         textPaint.setColor(cText);
         textPaint.setAlpha((int) (a * 255));
         textPaint.setTextSize(t.textSize);
-        Paint.FontMetrics fm = textPaint.getFontMetrics();
-        float ty = -(fm.ascent + fm.descent) / 2f;
+        textPaint.getFontMetrics(fontMetrics);
+        float ty = -(fontMetrics.ascent + fontMetrics.descent) / 2f;
         canvas.drawText(t.text, -textPaint.measureText(t.text) / 2f, ty, textPaint);
 
         // 配对成功的闪白
