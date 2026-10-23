@@ -51,24 +51,24 @@ public class CloudTrans {
     public static String translate(String text, boolean zh2en) {
         String provider = provider();
         if (PROVIDER_TENCENT.equals(provider)) {
-            String id = pref("tencent_secret_id");
-            String key = pref("tencent_secret_key");
+            String id = secret("tencent_secret_id");
+            String key = secret("tencent_secret_key");
             if (id.isEmpty() || key.isEmpty()) return null;
             return tencentTranslate(text, zh2en, id, key);
         }
         // 默认百度（老用户配置在这里）
-        String appId = pref("baidu_appid");
-        String secret = pref("baidu_secret");
-        if (appId.isEmpty() || secret.isEmpty()) return null;
-        return baiduTranslate(text, zh2en, appId, secret);
+        String appId = secret("baidu_appid");
+        String appSecret = secret("baidu_secret");
+        if (appId.isEmpty() || appSecret.isEmpty()) return null;
+        return baiduTranslate(text, zh2en, appId, appSecret);
     }
 
     /** 当前是否已经配好了可用的云端凭据 */
     public static boolean isConfigured() {
         if (PROVIDER_TENCENT.equals(provider())) {
-            return !pref("tencent_secret_id").isEmpty() && !pref("tencent_secret_key").isEmpty();
+            return !secret("tencent_secret_id").isEmpty() && !secret("tencent_secret_key").isEmpty();
         }
-        return !pref("baidu_appid").isEmpty() && !pref("baidu_secret").isEmpty();
+        return !secret("baidu_appid").isEmpty() && !secret("baidu_secret").isEmpty();
     }
 
     /** 当前选中的厂商名字（显示用） */
@@ -113,22 +113,72 @@ public class CloudTrans {
         } catch (Throwable t) {
             // 原来一律 return null，等于把 DNS 失败、证书错误、HTTP 4xx、JSON 解析失败、
             // 甚至 OOM 全说成"网络不通"，用户报"云端没反应"时无从查起
-            JLog.w("CloudTrans.baiduTranslate", t);
-            return "!ERR:" + why(t);
+            String reason = why(t);
+            logFailure("CloudTrans.baiduTranslate", t, reason);
+            return "!ERR:" + reason;
         } finally {
             if (conn != null) conn.disconnect();
         }
     }
 
-    /** 异常 → 一句用户能看懂的原因（配合 "!ERR:" 通道显示到界面上） */
+    /**
+     * 异常 → 一句用户能看懂的原因（配合 "!ERR:" 通道显示到界面上）
+     *
+     * 这里刻意不直接用 t.getMessage()：百度侧的异常消息里常带完整请求地址
+     *（appid 和 sign 都在里面），原样显示到界面 = 把凭据摊在用户眼前。
+     * 所以尾巴上的消息一律先过 safeMsg() 过一遍筛。
+     */
     private static String why(Throwable t) {
         if (t instanceof java.net.UnknownHostException) return "域名解析失败，请检查网络";
         if (t instanceof java.net.SocketTimeoutException) return "请求超时，请稍后再试";
         if (t instanceof javax.net.ssl.SSLException) return "安全连接建立失败";
-        if (t instanceof java.io.IOException) return "网络中断：" + t.getMessage();
+        if (t instanceof java.io.IOException) return "网络中断" + safeMsg(t);
         if (t instanceof org.json.JSONException) return "云端返回的内容无法解析";
-        String m = t.getMessage();
-        return t.getClass().getSimpleName() + (m == null || m.isEmpty() ? "" : "：" + m);
+        return t.getClass().getSimpleName() + safeMsg(t);
+    }
+
+    /**
+     * 异常消息尾巴：只在「短、且不含敏感标记」时才带出来。
+     * 含 http / appid / sign= / secret / key= / token 的一律丢掉。
+     */
+    private static String safeMsg(Throwable t) {
+        String m = (t == null) ? null : t.getMessage();
+        if (m == null) return "";
+        m = m.trim();
+        if (m.isEmpty() || m.length() > 80) return "";
+        if (isSensitiveMsg(m)) return "";
+        return "：" + m;
+    }
+
+    /**
+     * 消息里有没有不该出现的东西（请求地址、appid、sign…）。
+     * 等号和冒号两种分隔都查：URL 查询串用 appid=123，HTTP 头是 Authorization: Bearer …
+     * 2026-10-23 补了 authorization / credential / password —— 腾讯侧 TC3 的
+     * Authorization 头值形如 "TC3-HMAC-SHA256 Credential=…/…, SignedHeaders=…, Signature=…"，
+     * 光靠 sign= 只能拦住尾巴，Signature 和 Credential 都会漏出去。
+     */
+    private static boolean isSensitiveMsg(String m) {
+        if (m == null) return false;
+        String low = m.toLowerCase(Locale.US);
+        return low.contains("http") || low.contains("appid")
+                || low.contains("sign=") || low.contains("sign:")
+                || low.contains("secret") || low.contains("signature")
+                || low.contains("key=") || low.contains("key:")
+                || low.contains("token") || low.contains("authorization")
+                || low.contains("credential") || low.contains("password")
+                || low.contains("pwd");
+    }
+
+    /**
+     * 失败落日志：能安全记录时带完整栈（便于定位），否则只记干净的原因。
+     * 原始异常消息里可能带着完整的百度请求地址，原样进 logcat 等于把凭据写进日志文件。
+     */
+    private static void logFailure(String where, Throwable t, String reason) {
+        if (t != null && !isSensitiveMsg(t.getMessage())) {
+            JLog.e(where, t);
+        } else {
+            JLog.w(where, reason);
+        }
     }
 
     /** 百度错误码 → 人话 */
@@ -256,8 +306,9 @@ public class CloudTrans {
             }
             return targetText;
         } catch (Throwable t) {
-            JLog.w("CloudTrans.tencentTranslate", t);
-            return "!ERR:" + why(t);
+            String reason = why(t);
+            logFailure("CloudTrans.tencentTranslate", t, reason);
+            return "!ERR:" + reason;
         } finally {
             if (conn != null) conn.disconnect();
         }
@@ -341,6 +392,18 @@ public class CloudTrans {
     private static String pref(String key) {
         if (sPrefs == null) return "";
         String v = sPrefs.getString(key, "");
+        return v == null ? "" : v.trim();
+    }
+
+    /**
+     * 凭据从加密存储里取。
+     * 以前这里是 prefs.getString("baidu_secret") —— 明文躺在磁盘上；
+     * 现在走 SecretStore，磁盘上只剩 Keystore 密钥解不开的密文。
+     * 解不开（换了设备 / 密钥丢了）就当没配：用户重填一次即可。
+     */
+    private static String secret(String name) {
+        if (sPrefs == null) return "";
+        String v = SecretStore.get(sPrefs, name);
         return v == null ? "" : v.trim();
     }
 

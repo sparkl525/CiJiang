@@ -18,7 +18,9 @@ import android.view.View;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Random;
 
 /**
@@ -44,10 +46,6 @@ public class MatchGameView extends View {
         public final String en;
         public final String zh;
         public final int level;
-
-        public Pair(String en, String zh) {
-            this(en, zh, 0);
-        }
 
         public Pair(String en, String zh, int level) {
             this.en = en;
@@ -136,6 +134,21 @@ public class MatchGameView extends View {
     private Runnable onExhausted;                // 词典里能出的都出完了
     private Runnable onWaveChanged;              // 换了一屏（外面可以刷新"待回炉"数字）
 
+    /** 铺牌 / 记错词用的后台执行器，由外部注入（见 setWorker） */
+    public interface Worker {
+        void run(Runnable task);
+
+        /**
+         * 带兜底的提交：线程池已经收摊、或 Activity 正在销毁时，任务不会被排队，
+         * 这时在调用线程上就地执行 onRejected（也就是把这件事同步做完）。
+         * 存档这类"丢了就真丢了"的写库必须用它；取词可以丢，用 run(task) 就够。
+         */
+        void run(Runnable task, Runnable onRejected);
+    }
+
+    private Worker worker;                       // null = 没注入，就地同步铺牌
+    private int waveGen;                         // 牌面代数：迟到的取词结果一律作废
+
     private final ArrayList<Tile> tiles = new ArrayList<>();
     private final ArrayList<Grain> grains = new ArrayList<>();
     private final ArrayList<Fly> flies = new ArrayList<>();
@@ -148,6 +161,7 @@ public class MatchGameView extends View {
     private Listener listener;
 
     private float refillIn = -1f;      // >=0 表示正在等下一批上场
+    private long lastSwallowLog;       // 点空了的埋点节流（见 logSwallow）
     private boolean waveDealt;         // 这一屏是否真的铺过牌（防止空屏被当成"清屏"）
     private boolean exhausted;         // 词典里能出的词都出完了
     private int lastMode = -1;         // 上一屏的图案，避免连着两次一样
@@ -430,6 +444,18 @@ public class MatchGameView extends View {
         startGame();
     }
 
+    /**
+     * 词源换了内容、但没换对象时重铺一屏（神秘开关导入 / 退出导入）。
+     * 和 setSource 的区别是不清分数：玩家正在刷的连击和得分不该因为改词表被没收。
+     */
+    public void reloadWave() {
+        refillIn = -1f;
+        waveDealt = false;
+        exhausted = false;
+        newWave(false);
+        ensureLoop();
+    }
+
     /** 六级高频+中频都出现过一遍时回调（只报一次） */
     public void setOnMilestone(Runnable r) {
         onMilestone = r;
@@ -445,22 +471,39 @@ public class MatchGameView extends View {
         onWaveChanged = r;
     }
 
+    /**
+     * 注入一个后台执行器来取词。
+     * 一屏词要读 300 行的词表页、每个候选词还要回查一次释义，加上错词存档的读写，
+     * 全在 SQLite 上——放在界面线程里跑就是点 FAB 进游戏那一下的卡顿。
+     */
+    public void setWorker(Worker w) {
+        worker = w;
+    }
+
     public void setBest(int b) {
         best = Math.max(0, b);
     }
 
     /**
-     * 退出游戏时把进度落盘：词序游标由 GameWords 存，
+     * 退出这一页时把进度落盘：词序游标由 GameWords 存，
      * 这里把"屏幕上还没消掉的牌"一并交过去，下次进来先铺这几对。
+     * 牌面快照必须在界面线程读（tiles 只有这条线会改），写库本身交给后台。
      */
     public void persistProgress() {
-        if (source == null) return;
+        final GameWords src = source;
+        if (src == null) return;
         ArrayList<Pair> left = new ArrayList<>();
         for (Tile t : tiles) {
             if (t.dying) continue;
             if (!left.contains(t.pair)) left.add(t.pair);
         }
-        source.saveProgress(left);
+        Runnable save = () -> src.saveProgress(left);
+        if (worker != null) {
+            // 兜底同步执行：退出时线程池已经在收摊，任务被丢掉就等于这一屏白消了。
+            worker.run(save, save);
+        } else {
+            save.run();
+        }
     }
 
     /** 离开这一页时停掉重绘，别在后台空转 */
@@ -520,18 +563,61 @@ public class MatchGameView extends View {
     private void newWave(boolean advance) {
         tiles.clear();
         selected = null;
-        if (getWidth() <= 0 || getHeight() <= 0 || source == null) return;
+        waveDealt = false;
+        final GameWords src = source;
+        if (getWidth() <= 0 || getHeight() <= 0 || src == null) return;
 
-        ArrayList<Slot> slots = makeWaveSlots();
+        final ArrayList<Slot> slots = makeWaveSlots();
         if (slots.size() < 4) return;
 
         waveNo++;
-        ArrayList<Pair> picked = new ArrayList<>();
-        if (advance) picked.addAll(source.onWaveStart(2));   // 过完一屏：倒计时 -1，到期错词先占位
-        else picked.addAll(source.takeDueWrong(2));          // 刚进游戏：把上次到期没销号的先捞出来
-        picked.addAll(source.take(PAIRS_PER_WAVE - picked.size()));
+        final boolean firstWave = waveNo == 1;      // 第一屏必须有牌，见下面兜底
+        final int gen = ++waveGen;
+        final boolean adv = advance;
+
+        Runnable fetch = () -> {
+            ArrayList<Pair> picked = new ArrayList<>();
+            if (adv) picked.addAll(src.onWaveStart(2));   // 过完一屏：倒计时 -1，到期错词先占位
+            else picked.addAll(src.takeDueWrong(2));      // 刚进游戏：把上次到期没销号的先捞出来
+            picked.addAll(src.take(PAIRS_PER_WAVE - picked.size()));
+            final ArrayList<Pair> list = dedupe(picked);
+            post(() -> {
+                if (gen != waveGen || source != src) return;   // 期间重开了一局，别把旧牌贴上来
+                if (list.isEmpty() && firstWave) {
+                    // 开局一牌都取不到（词库正好见底）时就地补取一次，别铺出空棋盘：
+                    // 这时游戏页显示的是"准备中…"然后什么都没有，只能退出重进。
+                    // 走的是界面线程，但这条路径只在词库耗尽时命中，take() 会立刻返回。
+                    list.addAll(src.take(PAIRS_PER_WAVE));
+                }
+                dealWave(list, slots);
+            });
+        };
+        if (worker != null) worker.run(fetch);
+        else fetch.run();
+    }
+
+    /**
+     * 同一屏去重：按词形，也按中文。
+     * 正常词库和回炉词都登记过「已出过」，这里只兜住极端情况；
+     * 自定义词表里"贴的释义"和"词典补的释义"可能撞成同一个词（abandon/desert 都是「放弃」），
+     * 那种情况下屏幕上就是两块一模一样的中文，玩家没法配，只能在这一层拦掉。
+     */
+    private static ArrayList<Pair> dedupe(ArrayList<Pair> in) {
+        ArrayList<Pair> out = new ArrayList<>();
+        HashSet<String> seen = new HashSet<>();
+        HashSet<String> seenZh = new HashSet<>();
+        for (Pair p : in) {
+            if (p == null || p.en == null) continue;
+            if (!seen.add(p.en.trim().toLowerCase(Locale.US))) continue;
+            if (p.zh != null && !p.zh.trim().isEmpty() && !seenZh.add(p.zh.trim())) continue;
+            out.add(p);
+        }
+        return out;
+    }
+
+    /** 界面线程：把一组词对贴到算好的图案上 */
+    private void dealWave(ArrayList<Pair> picked, ArrayList<Slot> slots) {
         if (picked.isEmpty()) {           // 词典里能出的都出完了
-            waveDealt = false;
             exhausted = true;
             if (onExhausted != null) post(onExhausted);
             return;
@@ -550,8 +636,10 @@ public class MatchGameView extends View {
         }
         waveDealt = !tiles.isEmpty();
 
-        if (source.consumeMilestone() && onMilestone != null) post(onMilestone);
+        if (source != null && source.consumeMilestone() && onMilestone != null) post(onMilestone);
         if (onWaveChanged != null) post(onWaveChanged);
+        invalidate();
+        ensureLoop();
     }
 
     private void addTile(Pair p, boolean english, Slot s, float appearStart) {
@@ -569,9 +657,17 @@ public class MatchGameView extends View {
         tiles.add(t);
     }
 
-    /** 记一个错词（存档在 study.db 里，退出游戏也不会丢） */
+    /**
+     * 记一个错词（存档在 study.db 里，退出游戏也不会丢）。
+     * rememberWrong 内部是 4 条 SQL（进错题集 + 数存档 + 查重复 + 写回炉），
+     * 点错那一下正在放散沙动画，同步跑就是肉眼可见的一次顿挫 —— 挪到后台。
+     * 取回炉词走的是同一条 FIFO 队列，顺序不会乱：这一记一定在下屏取词之前落库。
+     */
     private void rememberWrong(Pair p) {
-        if (source != null) source.rememberWrong(p);
+        final GameWords src = source;
+        if (src == null || p == null) return;
+        if (worker != null) worker.run(() -> src.rememberWrong(p));
+        else src.rememberWrong(p);
     }
 
     // ================= 图案 =================
@@ -589,12 +685,42 @@ public class MatchGameView extends View {
 
         for (int attempt = 0; attempt < 5; attempt++) {
             ArrayList<Slot> s = buildByMode(attempt == 0 ? mode : rnd.nextInt(6), w, h);
+            // 先归正再松弛：relax 按 rot 算包围盒，角度必须和最后画出来的一致，
+            // 否则"按竖着的样子推开、画出来是横着的"就会压在一起。
+            keepUpright(s);
             relax(s, w, h);
             if (!hasOverlap(s)) return s;
         }
         ArrayList<Slot> s = buildStagger(w, h);
+        keepUpright(s);
         relax(s, w, h);
         return s;
+    }
+
+    /** 方块最多歪这么多度（超过就归正，保证文字永远正着读） */
+    private static final float MAX_TILT = 6f;
+
+    /**
+     * 把任意角度收进 ±MAX_TILT。
+     * 先折到 (-180,180]，再折到 (-90,90]——落在 90 以外说明这块牌本来就是
+     * 侧躺或倒过来的，转 180° 就正过来了（方块四边对称，看不出被转过）。
+     */
+    private static float upright(float rot) {
+        float r = rot % 360f;
+        if (r > 180f) r -= 360f;
+        else if (r <= -180f) r += 360f;
+        if (r > 90f) r -= 180f;
+        else if (r < -90f) r += 180f;
+        return Math.max(-MAX_TILT, Math.min(MAX_TILT, r));
+    }
+
+    /**
+     * 一屏牌面的总闸门：不管哪种图案、以后再加什么图案，
+     * 词块都不会翻转或颠倒（v3.15.1 的要求——斜着歪一下是趣味，
+     * 字倒过来就得歪着头看，背单词时很别扭）。
+     */
+    private void keepUpright(List<Slot> s) {
+        for (Slot t : s) t.rot = upright(t.rot);
     }
 
     private ArrayList<Slot> buildByMode(int mode, float w, float h) {
@@ -676,7 +802,11 @@ public class MatchGameView extends View {
         return out;
     }
 
-    /** 图案四：椭圆环上 8 块 + 中心 2 块，方块沿切线歪一点 */
+    /**
+     * 图案四：椭圆环上 8 块 + 中心 2 块。
+     * 早先这里让方块沿切线转（环底部的词就是倒着的），改成只随机歪一点点，
+     * 位置还是环，读起来不用再歪头。
+     */
     private ArrayList<Slot> buildRing(float w, float h) {
         ArrayList<Slot> out = new ArrayList<>();
         float bw = Math.min(dp(118), w * 0.31f), bh = baseH(h);
@@ -687,7 +817,7 @@ public class MatchGameView extends View {
             double ang = off + i * Math.PI / 4;
             float x = w / 2f + (float) (Math.cos(ang) * rx);
             float y = h / 2f + (float) (Math.sin(ang) * ry);
-            out.add(new Slot(x, y, bw, bh, (float) Math.toDegrees(ang) + 90f));
+            out.add(new Slot(x, y, bw, bh, jitterRot()));
         }
         out.add(new Slot(w / 2f + jitter(w * 0.02f), h / 2f - h * 0.09f, bw, bh, jitterRot()));
         out.add(new Slot(w / 2f + jitter(w * 0.02f), h / 2f + h * 0.09f, bw, bh, jitterRot()));
@@ -835,10 +965,29 @@ public class MatchGameView extends View {
     @Override
     public boolean onTouchEvent(MotionEvent e) {
         if (e.getActionMasked() == MotionEvent.ACTION_DOWN) {
+            // 手指落下先把动画时钟叫醒。
+            // refillIn 的倒计时只在 step() 里减，而 step() 只在循环活着的时候跑；
+            // 一旦 stop()（切后台、离页）之后没人再 ensureLoop，牌面就停在
+            // "看着正常、点什么都不换色"的状态——这一行让它自己恢复。
+            ensureLoop();
             Tile hit = hitTest(e.getX(), e.getY());
-            if (hit != null) onTap(hit);
+            if (hit == null) logSwallow();
+            else onTap(hit);
         }
         return true;      // 全部吃掉，别让外层把事件当成滚动
+    }
+
+    /**
+     * 埋点：牌明明在屏幕上却点不着，就记一行（两秒最多一次，别刷屏）。
+     * 这种问题在电脑上复现不了，出问题的人手机 logcat 里得留下一条能看的线索。
+     */
+    private void logSwallow() {
+        if (tiles.isEmpty() || source == null) return;
+        long now = System.currentTimeMillis();
+        if (now - lastSwallowLog < 2000) return;
+        lastSwallowLog = now;
+        JLog.w("game.tap", "点空了：tiles=" + tiles.size()
+                + " refillIn=" + refillIn + " looping=" + looping);
     }
 
     private Tile hitTest(float x, float y) {
@@ -853,7 +1002,11 @@ public class MatchGameView extends View {
     }
 
     private void onTap(Tile hit) {
-        if (hit.dying || refillIn >= 0) return;
+        if (hit.dying) return;
+        // 清屏后那 0.45 秒不给点：那是"上一屏消干净了、下一屏的词还在路上"的空档，
+        // 这时候牌面本来就是空的。反过来——要是 refillIn 还压着而屏幕上明明有牌，
+        // 说明倒计时停摆了（时钟被 stop 过），这时再吞点击就是"牌在那儿点不动"。
+        if (refillIn >= 0 && tiles.isEmpty()) return;
         if (selected == null) {
             selected = hit;
             hit.selected = true;

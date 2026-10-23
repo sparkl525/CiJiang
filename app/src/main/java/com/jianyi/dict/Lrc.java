@@ -47,7 +47,7 @@ public class Lrc {
                 ms = Integer.parseInt(mm) * 60000L + Integer.parseInt(ss) * 1000L;
                 if (dot >= 0 && dot + 1 < rest.length()) {
                     String frac = rest.substring(dot + 1);
-                    if (isNum(frac)) ms += Long.parseLong(frac) * fractionMillis(frac);
+                    if (isNum(frac)) ms += fractionMillis(frac);
                 }
             } catch (NumberFormatException e) {
                 continue;
@@ -64,15 +64,17 @@ public class Lrc {
     }
 
     /**
-     * 小数部分每一位代表多少毫秒。
+     * 小数部分折算成毫秒。
      * 字幕里 .5 / .04 / .123 / .0400 都出现过，位数不固定，只能按位数折算：
      * .5 是 500ms 而不是 5ms，.0400 是 40ms 而不是 400ms。
+     * （超过 3 位的是微秒级噪声，先截断再折算——原来在这里直接用整串做乘数，
+     * 截断只对「单位」生效、对「数值」没生效，四位小数会被放大成 400ms。）
      */
     private static long fractionMillis(String frac) {
-        if (frac.length() > 3) frac = frac.substring(0, 3);   // 超出 3 位是微秒噪声，丢掉
+        if (frac.length() > 3) frac = frac.substring(0, 3);
         long unit = 1;
         for (int i = 3 - frac.length(); i > 0; i--) unit *= 10;
-        return unit;
+        return Long.parseLong(frac) * unit;
     }
 
     /** 当前播放位置落在第几句；没找到就返回 -1 */

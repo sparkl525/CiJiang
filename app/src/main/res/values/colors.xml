@@ -22,5 +22,7 @@
     <color name="btn_stroke">#FFE3DACC</color>
     <color name="btn_ripple">#14000000</color>
 
-    <color name="ic_launcher_background">#FFFFFFFF</color>
+    <!-- 自适应图标兜底底色：取瓷片最外一圈的像素均值（#F8F9F5），
+         前景是位图瓷片，边缘羽化后正好融进这个底色，看不出接缝 -->
+    <color name="ic_launcher_background">#FFF8F9F5</color>
 </resources>

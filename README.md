@@ -1,8 +1,8 @@
-# 简译 JianYi
+# 词桨 JianYi
 
 一款极简的离线中英学习 Android 应用。白底、无广告、无需注册，装上就能用。
 
-> 当前版本：v3.9.2（versionCode 55）· 仅支持 arm64-v8a
+> 当前版本：v3.16.1（versionCode 66）· 仅支持 arm64-v8a
 
 ## 下载安装
 

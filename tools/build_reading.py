@@ -14,7 +14,7 @@ import re
 
 # ─── 路径推导：公开仓库里不写死个人路径，一律相对脚本位置算出来 ───
 _TOOLS = os.path.dirname(os.path.abspath(__file__))
-PROJ = os.path.dirname(_TOOLS)                  # 简译工程根目录
+PROJ = os.path.dirname(_TOOLS)                  # 词桨工程根目录
 WS = os.path.dirname(PROJ)                      # 开发工作区（外部素材/日志放这）
 DESKTOP = os.path.join(os.path.expanduser("~"), "Desktop")
 
@@ -196,7 +196,7 @@ def main():
                                         "内置" if g.get("builtin") else "在线"))
 
     manifest = dict(version=1, updated="2026-09-22", baseUrl=BASE_URL,
-                    note="简译 App 阅读素材清单。builtin=true 的已内置在 APK，"
+                    note="词桨 App 阅读素材清单。builtin=true 的已内置在 APK，"
                          "其余由「素材包」开关联网下载到手机。",
                     items=items)
     # APK 里叫 manifest.json（App 读这个）；仓库根用 reading.json，免得和听力清单互相覆盖

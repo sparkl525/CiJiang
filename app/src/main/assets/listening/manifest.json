@@ -2,7 +2,7 @@
   "version": 4,
   "updated": "2026-10-20",
   "baseUrl": "https://cdn.jsdelivr.net/gh/sparkl525/-v2.0@main",
-  "note": "简译 App 听力素材清单。精品素材均为 VOA Learning English（美国政府作品·公共域）。l-005~l-009 已内置进 APK（v3.2.2 起）；builtin=false 的新条目由「素材包」联网下载。",
+  "note": "词桨 App 听力素材清单。精品素材均为 VOA Learning English（美国政府作品·公共域）。l-005~l-009 已内置进 APK（v3.2.2 起）；builtin=false 的新条目由「素材包」联网下载。",
   "items": [
     {
       "id": "l-005",

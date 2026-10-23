@@ -41,7 +41,7 @@ _TOOLS = os.path.dirname(os.path.abspath(__file__))
 # 本脚本放在 D:\android-dev\tools（工作区侧），工程在 D:\android-dev\JianYi。
 # 仓库内还有一份快照在 JianYi\tools\build_dict.py，那份的 PROJ 推导方式不同，两边别混。
 WS = os.path.dirname(_TOOLS)                    # 开发工作区 D:\android-dev
-PROJ = os.path.join(WS, "JianYi")               # 简译工程根目录
+PROJ = os.path.join(WS, "JianYi")               # 词桨工程根目录
 BAK_DIR = os.path.join(WS, "backups")
 
 DBZ = PROJ + r"\app\src\main\assets\db\dict.dbz"

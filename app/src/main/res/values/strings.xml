@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">简译</string>
+    <string name="app_name">词桨</string>
     <string name="tab_dict">查词</string>
     <string name="tab_translate">翻译</string>
     <string name="tab_camera">拍照</string>
@@ -8,4 +8,7 @@
     <string name="history">历史</string>
     <string name="clear_history">清空</string>
     <string name="back">← 返回</string>
+    <string name="game_magic">✦</string>
+    <string name="game_magic_desc">神秘开关：导入自己的词来出题</string>
+    <string name="game_magic_ocr">不想打字？点此拍照识别</string>
 </resources>

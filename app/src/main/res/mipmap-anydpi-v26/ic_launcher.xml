@@ -1,5 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- 自适应图标（Android 8+）：纸船瓷片前景 + 瓷片同色的底。
+     前景是位图（那套 3D 质感和渐变是位图才画得出来）。
+     画布 108dp、系统只露中间 72dp，所以瓷片按 72dp 摆、
+     四周留的空白由背景层的同色兜底；瓷片边缘做了羽化，
+     圆形/圆角遮罩切过去都看不出边。 -->
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
     <background android:drawable="@color/ic_launcher_background" />
-    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <foreground android:drawable="@mipmap/ic_launcher_foreground" />
 </adaptive-icon>
