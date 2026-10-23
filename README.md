@@ -6,7 +6,7 @@
 
 ## 下载安装
 
-**[⬇ 下载最新版 APK](https://github.com/sparkl525/JianYi/releases/latest)**
+**[⬇ 下载最新版 APK](https://github.com/sparkl525/CiJiang/releases/latest)**
 
 要求 Android 7.0（API 24）及以上 / arm64-v8a。手机允许「安装未知来源应用」后即可安装；
 装过旧版可直接覆盖安装，签名一致，不会丢学习记录。各版本变更见 [CHANGELOG.md](CHANGELOG.md)。
