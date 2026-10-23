@@ -24,8 +24,7 @@ import java.util.HashSet;
  */
 public class StudyDb {
 
-    private static final long DAY = 24L * 60 * 60 * 1000;
-    private static final long[] GAPS = {DAY, 2 * DAY, 4 * DAY, 8 * DAY, 16 * DAY};
+    // 复习间隔的算法在 Leitner（纯计算、可单测），这里只负责把它落进 fav 表。
 
     private final SQLiteDatabase db;
 
@@ -228,6 +227,21 @@ public class StudyDb {
         return has;
     }
 
+    /**
+     * 待回炉清单：词、当时看到的中文、还剩几屏。
+     * 排在前面的先到期（remain 小），一眼能看出「马上要回来的」是哪几个。
+     */
+    public ArrayList<String[]> gameWrongList() {
+        ArrayList<String[]> out = new ArrayList<>();
+        Cursor c = db.rawQuery(
+                "SELECT word, zh, remain FROM game_wrong ORDER BY remain ASC, rowid ASC", null);
+        while (c.moveToNext()) {
+            out.add(new String[]{c.getString(0), c.getString(1), String.valueOf(c.getInt(2))});
+        }
+        c.close();
+        return out;
+    }
+
     /** 老版本没有 fav_flag 列，补上；已存在则跳过 */
     private void ensureFavFlag() {
         Cursor c = db.rawQuery("PRAGMA table_info(fav)", null);
@@ -316,6 +330,17 @@ public class StudyDb {
         return out;
     }
 
+    /**
+     * 从错题集里删掉一个词。
+     *
+     * 只把 wrong 记零，不动收藏标记和复习进度：这个词是「不再算错题」，
+     * 不是「不再收藏」——用户要是想连收藏一起清，词条卡片上的星标还在。
+     */
+    public void removeWrong(String w) {
+        if (w == null || w.isEmpty()) return;
+        db.execSQL("UPDATE fav SET wrong=0 WHERE word=?", new Object[]{w});
+    }
+
     // ================= Leitner 复习调度（原有）=================
 
     /** 答对：进下一格，到期时间往后推。没收藏过的词不做记录 */
@@ -344,8 +369,8 @@ public class StudyDb {
                 }
                 box = c.getInt(0);
             }
-            box = ok ? Math.min(box + 1, GAPS.length - 1) : 0;
-            long due = System.currentTimeMillis() + GAPS[box];
+            box = Leitner.nextBox(box, ok);
+            long due = Leitner.dueAt(box, System.currentTimeMillis());
             db.execSQL("UPDATE fav SET box=?, due=?, wrong=wrong+?, right=right+? WHERE word=?",
                     new Object[]{box, due, ok ? 0 : 1, ok ? 1 : 0, w});
             db.setTransactionSuccessful();

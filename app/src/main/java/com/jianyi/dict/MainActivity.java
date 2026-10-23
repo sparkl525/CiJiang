@@ -1,5 +1,6 @@
 package com.jianyi.dict;
 
+import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ClipData;
@@ -7,6 +8,7 @@ import android.content.ClipboardManager;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.content.res.AssetFileDescriptor;
 import android.content.res.Configuration;
 import android.graphics.Bitmap;
@@ -22,16 +24,19 @@ import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.LayerDrawable;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.MediaStore;
 import android.text.Editable;
+import android.text.InputType;
 import android.text.SpannableString;
 import android.text.Spanned;
 import android.text.TextPaint;
 import android.text.TextWatcher;
 import android.text.method.LinkMovementMethod;
+import android.text.method.PasswordTransformationMethod;
 import android.text.style.ClickableSpan;
 import android.view.Gravity;
 import android.view.View;
@@ -111,7 +116,8 @@ public class MainActivity extends Activity {
 
     /** 一条还没落地的答题/复习落库记录 */
     private static final class StudyWrite {
-        static final int CORRECT = 0, WRONG = 1, RELEARN = 2, FAV = 3, UNFAV = 4, RESET = 5;
+        static final int CORRECT = 0, WRONG = 1, RELEARN = 2, FAV = 3, UNFAV = 4, RESET = 5,
+                DELWRONG = 6;      // 从错题集里删掉（不清收藏、不动复习进度）
         final String word;
         final int kind;
         /** 落库完成后要在界面线程补做的刷新（比如重新渲染单词本），可为 null */
@@ -144,6 +150,10 @@ public class MainActivity extends Activity {
     private Uri pendingPhotoUri;
     private TextRecognizer recognizer;       // 中文模型（中英混排的主力）
     private TextRecognizer latinRecognizer;  // 拉丁模型（纯英文更准，v3.3 起双跑取优）
+    // 神秘开关借道拍照识别：相机和识别走现成的那套，只是结果不进拍照页、直接灌回导入框。
+    // 游戏页整个流程都不退，弹窗是浮在最上面的窗口，回来接着开就是。
+    private boolean magicFromOcr;
+    private String magicDraft = "";          // 去拍照之前已经手打的字，回来接在后面
 
     // ===== 发音 =====
     private Pron pron;
@@ -169,7 +179,7 @@ public class MainActivity extends Activity {
     private View topBar, tabBar, topDivider, pageStudy, pageReading, pageWordBook, pageWrongBook, fabWordBook, fabWrongBook, fabStudyStats;
     private View pageGame, fabGame;
     private MatchGameView gameView;
-    private TextView gameScore, gameTip;
+    private TextView gameScore, gameTip, gameMagic;
     private GameWords gameWords;
     private View contentHost;               // 顶栏/标签栏下面的内容容器（几何补偿用）
     private DragHint studyHint, readingHint, wbHint, wrongHint;
@@ -311,9 +321,27 @@ public class MainActivity extends Activity {
         gameView = findViewById(R.id.gameView);
         gameScore = findViewById(R.id.gameScore);
         gameTip = findViewById(R.id.gameTip);
+        // 「待回炉 N 个」那行小字可以点：点开看排着队的到底是哪些词
+        gameTip.setOnClickListener(v -> showPendingWrongDialog());
+        gameMagic = findViewById(R.id.gameMagic);
+        gameMagic.setOnClickListener(v -> showMagicDialog());
         findViewById(R.id.gameBack).setOnClickListener(v -> closeGame());
         dictStatus = findViewById(R.id.dictStatus);
         gameView.setOnWaveChanged(this::refreshGameTip);
+        // 取词要读词表页、逐词回查释义、还要动错词存档，全是 SQLite：
+        // 交给 dbPool 那条线去做，界面线程只负责把牌贴上去（见 MatchGameView.newWave）。
+        gameView.setWorker(new MatchGameView.Worker() {
+            @Override
+            public void run(Runnable task) {
+                submitDb("gameWave", task);
+            }
+
+            @Override
+            public void run(Runnable task, Runnable onRejected) {
+                // 池子收摊 / 正在销毁时 submitDb 不排队，改在调用线程就地做完
+                submitDb("gameWave", task, onRejected);
+            }
+        });
         gameView.setListener((sc, cb, bs) -> {
             StringBuilder sb = new StringBuilder("得分 ").append(sc);
             if (cb >= 2) sb.append("　连击 ×").append(cb);
@@ -546,7 +574,7 @@ public class MainActivity extends Activity {
         // 标题长按显示版本信息（排查问题时用）
         findViewById(R.id.titleText).setOnLongClickListener(v -> {
             new AlertDialog.Builder(this)
-                    .setTitle("简译")
+                    .setTitle("词桨")
                     .setMessage("版本 " + getString(R.string.app_name) + " v" + BuildConfig.VERSION_NAME
                             + "\n词典 35.5 万词条（ECDICT 精选）\n翻译引擎：ML Kit 离线 + 云端增强（可选）\n文字识别：ML Kit 离线 OCR")
                     .setPositiveButton("好", null)
@@ -799,13 +827,22 @@ public class MainActivity extends Activity {
 
     // ================= 崩溃自捕获：下次启动可查看并复制 =================
 
+    /**
+     * 崩溃栈落盘前先洗一遍敏感内容（见 Redact）。
+     * 栈里最常见的是请求地址：百度那侧的 URL 带着 appid 和 sign，腾讯侧的
+     * Authorization 头带着签名。原样落盘 = 给「谁都能读到的日志文件」附赠
+     * 一份凭据清单；这份日志是要发给开发者定位问题的，不该顺手把用户凭据也发出去。
+     */
     private void setupCrashHandler() {
         final Thread.UncaughtExceptionHandler prev = Thread.getDefaultUncaughtExceptionHandler();
         Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
             try {
                 StringWriter sw = new StringWriter();
                 e.printStackTrace(new PrintWriter(sw));
-                String stamp = "---- " + System.currentTimeMillis() + " ----\n" + sw.toString();
+                // 栈里最常见的是请求地址：百度那侧的 URL 带着 appid 和 sign，
+                // 原样落盘 = 给「谁都能读到的日志文件」附赠一份凭据清单。落盘前先洗一遍。
+                String stamp = "---- " + System.currentTimeMillis() + " ----\n"
+                        + Redact.crash(sw.toString());
                 writeCrashFile(new File(getFilesDir(), "crash.log"), stamp);
                 File ext = getExternalFilesDir(null);     // 外部存储：USB 直接拉，不依赖对话框
                 if (ext != null) writeCrashFile(new File(ext, "crash.log"), stamp);
@@ -824,6 +861,11 @@ public class MainActivity extends Activity {
         if (!f.exists() || f.length() == 0) return;
         String full = readCrashFile(f);
         f.delete();                       // 读失败也删，避免每次启动都卡在这里
+        // 外部存储那份是给「插 USB 直接拉」用的；内容已经进了下面的对话框，
+        // 留着只会让它长期躺在外部存储上（Android 10 及以下别的 App 读得到）。
+        // 这次消费掉，下次崩溃会重新写一份新的。
+        File ext = getExternalFilesDir(null);
+        if (ext != null) new File(ext, "crash.log").delete();
         if (full == null || full.trim().isEmpty()) return;
         // 再等一次窗口挂载，双保险
         getWindow().getDecorView().post(() -> showCrashDialog(full));
@@ -831,6 +873,9 @@ public class MainActivity extends Activity {
 
     private void writeCrashFile(File f, String content) {
         try {
+            // 别让崩溃日志无限长：外部存储那份尤其要看着点。
+            // 超过 512KB 就从新的一份写起，只留最近这次。
+            if (f.exists() && f.length() > 512 * 1024) f.delete();
             PrintWriter pw = new PrintWriter(new FileWriter(f, true));
             pw.println(content);
             pw.close();
@@ -2464,9 +2509,13 @@ public class MainActivity extends Activity {
         slideIn(pageGame, false);
         updateFabs();
         gameScore.setText("准备中…");
+        // 神秘开关的状态要在后台取词之前就定下来：自定义模式根本不查词典，晚一步就白跑一趟
+        final String magicText = prefs == null ? "" : prefs.getString("game_magic_text", "");
+        final boolean magicOn = prefs != null && prefs.getBoolean("game_magic_on", false);
         submitDb("gamePrepare", () -> {
             final GameWords src = new GameWords(dict, studyDb);
             src.prepare();                       // 读个人词 + 算分档边界，可能要几百毫秒
+            if (magicOn) src.useImport(WordImport.parse(magicText));   // 接着上次导入的那份词表
             runOnUiThread(() -> {
                 if (!isPageVisible(pageGame)) return;      // 准备期间已经退出去了
                 gameWords = src;
@@ -2477,13 +2526,252 @@ public class MainActivity extends Activity {
         });
     }
 
+    /**
+     * 右上角那颗 ✦：平时就是个安静的符号，开着自定义词表时点亮成墨绿、后面跟词数。
+     * 按钮上不写"神秘开关"四个字——说明交给下面那行小字，位置留给牌面。
+     * @param customCount 小于 0 = 开关关着；否则当前导入的词数
+     */
+    private void refreshMagicChip(int customCount) {
+        if (gameMagic == null) return;
+        boolean on = customCount >= 0;
+        gameMagic.setText(on ? "✦ " + customCount : "✦");
+        gameMagic.setTextColor(getColor(on ? R.color.accent : R.color.text_secondary));
+    }
+
     /** 顶部小字：有错词压着就报个数字，让"存档"看得见 */
     private void refreshGameTip() {
         if (gameTip == null) return;
-        int n = gameWords == null ? 0 : gameWords.pendingWrongCount();
-        gameTip.setText(n > 0
-                ? "点英文，再点它对应的中文　·　待回炉 " + n + " 个"
-                : "点英文，再点它对应的中文；整屏消干净自动换一批新词");
+        final GameWords gw = gameWords;
+        if (gw == null) {
+            gameTip.setText("点英文，再点它对应的中文；整屏消干净自动换一批新词");
+            refreshMagicChip(-1);
+            return;
+        }
+        // 开关本身也要看得出开着：词源换了却不写出来，人会以为词典坏了
+        refreshMagicChip(gw.isCustom() ? gw.customCount() : -1);
+        if (gw.isCustom()) {
+            gameTip.setText("自定义词表出题　·　消干净就换下一批，这套词会一直循环");
+            return;
+        }
+        // countGameWrong() 是查库，不能在这条线上跑：换屏回调正好落在滑入动画中间，
+        // 界面线程被 SQLite 拽住就是那零点几秒的顿挫。
+        submitDb("refreshGameTip", () -> {
+            final int n = gw.pendingWrongCount();
+            runOnUiThread(() -> {
+                if (gameTip == null || !isPageVisible(pageGame)) return;
+                if (n <= 0) {
+                    gameTip.setText("点英文，再点它对应的中文；整屏消干净自动换一批新词");
+                    return;
+                }
+                // 「待回炉 N 个」这半句是能点的：做成主色，一眼能看出这里有事可点
+                String head = "点英文，再点它对应的中文　·　";
+                String tail = "待回炉 " + n + " 个";
+                SpannableString ss = new SpannableString(head + tail);
+                ss.setSpan(new android.text.style.ForegroundColorSpan(getColor(R.color.accent)),
+                        head.length(), head.length() + tail.length(),
+                        Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                gameTip.setText(ss);
+            });
+        });
+    }
+
+    /**
+     * 待回炉清单：配错的词还排着队，点顶部那行「待回炉 N 个」就能看到是哪些。
+     * 读库放后台线程 —— 这项目一直守着「界面线程不碰 SQLite」这条线。
+     */
+    private void showPendingWrongDialog() {
+        submitDb("showPendingWrong", () -> {
+            final ArrayList<String[]> rows;
+            try {
+                rows = (studyDb == null) ? new ArrayList<String[]>() : studyDb.gameWrongList();
+            } catch (Throwable t) {
+                JLog.w("MainActivity.showPendingWrong", t);
+                runOnUiThread(() -> Toast.makeText(this, "读取待回炉清单失败", Toast.LENGTH_SHORT).show());
+                return;
+            }
+            runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                LinearLayout box = new LinearLayout(this);
+                box.setOrientation(LinearLayout.VERTICAL);
+                int p = dp(20);
+                box.setPadding(p, dp(8), p, dp(8));
+                if (rows.isEmpty()) {
+                    TextView empty = new TextView(this);
+                    empty.setText("现在没有待回炉的词。");
+                    empty.setTextColor(getColor(R.color.text_secondary));
+                    empty.setTextSize(15);
+                    empty.setPadding(0, dp(16), 0, dp(16));
+                    box.addView(empty);
+                } else {
+                    for (String[] r : rows) box.addView(buildPendingWrongRow(r));
+                }
+                ScrollView sv = new ScrollView(this);
+                sv.addView(box);
+                new AlertDialog.Builder(this)
+                        .setTitle(rows.isEmpty() ? "待回炉" : "待回炉的词（" + rows.size() + "）")
+                        .setView(sv)
+                        .setPositiveButton("知道了", null)
+                        .show();
+            });
+        });
+    }
+
+    /** 清单里的一行：词 + 当时看到的中文 + 还剩几屏 */
+    private View buildPendingWrongRow(String[] r) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.VERTICAL);
+        row.setPadding(0, dp(9), 0, dp(9));
+        TextView w = new TextView(this);
+        w.setText(r[0]);
+        w.setTextColor(getColor(R.color.text_primary));
+        w.setTextSize(17);
+        w.setTypeface(null, Typeface.BOLD);
+        row.addView(w);
+        String zh = (r[1] == null) ? "" : r[1].trim();
+        String remain = (r[2] == null) ? "0" : r[2];
+        TextView m = new TextView(this);
+        m.setText((zh.isEmpty() ? "" : zh + "　·　") + "还剩 " + remain + " 屏");
+        m.setTextColor(getColor(R.color.text_secondary));
+        m.setTextSize(13);
+        m.setPadding(0, dp(3), 0, 0);
+        row.addView(m);
+        return row;
+    }
+
+    /**
+     * 神秘开关：导入自己的词来出题（v3.15.1）。
+     * 一行一个词，词和释义可以写在一起（apple 苹果 / apple=苹果），
+     * 只写词就用词典里的释义；词典查不到又没给释义的那行会被丢掉并在结果里报数。
+     * 原文整份存在 prefs 里，下次进游戏还是这套词，点「用回词典」才关。
+     */
+    private void showMagicDialog() {
+        showMagicDialog(prefs == null ? "" : prefs.getString("game_magic_text", ""));
+    }
+
+    /** prefill = 框里预先摆好的字（上次那份，或刚从拍照识别里拿回来的） */
+    private void showMagicDialog(String prefill) {
+        if (dict == null) {
+            Toast.makeText(this, "词典还在加载，稍等一下", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int p = dp(20);
+        box.setPadding(p, dp(6), p, 0);
+
+        TextView note = new TextView(this);
+        note.setTextSize(12);
+        note.setTextColor(getColor(R.color.text_secondary));
+        note.setText("一行一个词，中英可以分开写：\n"
+                + "　apple 苹果　　apple=苹果　　apple, 苹果\n"
+                + "只写英文就用词典里的释义；带序号、词性（1. apple 苹果 / abandon v. 放弃）都认。"
+                + "最多 " + WordImport.MAX_WORDS + " 个词。");
+        box.addView(note);
+
+        final EditText et = new EditText(this);
+        // 和 searchBox / translateInput / ocrText 一致：别让自动填充服务把这里的内容
+        // 收进去再到处提议。setImportantForAutofill 是 API 26 才有的，低版本上调用会
+        // NoSuchMethodError，必须守版本（XML 里那条属性在老系统上是被忽略的，两码事）。
+        if (Build.VERSION.SDK_INT >= 26) {
+            et.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
+        }
+        et.setMinLines(4);
+        et.setMaxLines(8);
+        et.setGravity(Gravity.TOP | Gravity.START);
+        et.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+        et.setHint("把要练的词贴在这里");
+        et.setTextSize(15);
+        et.setText(prefill == null ? "" : prefill);
+        et.setPadding(dp(10), dp(8), dp(10), dp(8));
+        et.setBackgroundResource(R.drawable.input_bg);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(10);
+        et.setLayoutParams(lp);
+        box.addView(et);
+
+        // 不想打字的走拍照：这一行只是个小字链接，不抢白卡片按钮的位置
+        TextView toOcr = new TextView(this);
+        toOcr.setText(R.string.game_magic_ocr);
+        toOcr.setTextSize(13);
+        toOcr.setTextColor(getColor(R.color.accent));
+        toOcr.setPadding(0, dp(10), 0, 0);
+        final AlertDialog[] self = new AlertDialog[1];
+        toOcr.setOnClickListener(v -> {
+            magicDraft = et.getText() == null ? "" : et.getText().toString();
+            magicFromOcr = true;
+            if (self[0] != null) self[0].dismiss();
+            takePhoto();       // 相机是另一个应用，底下的游戏页不用退，回来再把弹窗开起来
+        });
+        box.addView(toOcr);
+
+        AlertDialog dlg = new AlertDialog.Builder(this)
+                .setTitle("神秘开关 · 用我导入的词出题")
+                .setView(box)
+                .setPositiveButton("就用这些词", (d, w) -> applyMagic(et.getText().toString()))
+                .setNeutralButton("用回词典", (d, w) -> {
+                    magicFromOcr = false;      // 人都走了，别留着让下一张照片往外冒弹窗
+                    applyMagic(null);
+                })
+                .setNegativeButton("取消", null)
+                .create();
+        self[0] = dlg;
+        dlg.show();
+    }
+
+    /**
+     * 导入文本的字符上限（v3.16.1 修）。
+     * 为什么要有：原文会整份存进 prefs（XML 每次启动全量载入内存），
+     * WordImport.parse 里又会 split("\\R") 全量数组化。粘个几 MB 的大家伙，
+     * 低内存老机就是 OOM / 启动卡顿。词表再长也超不过 10 万字，截断不心疼。
+     */
+    private static final int MAGIC_MAX_CHARS = 100_000;
+
+    /** 应用 / 退出自定义词表：解析和查词典都在 dbPool 上，查一千个词也得几百毫秒 */
+    private void applyMagic(String raw) {
+        if (prefs == null) return;
+        magicFromOcr = false;     // 词已经交上去了（或明确退回词典），这次借道到此为止
+        hideKeyboard();         // 弹窗收了，输入法也一并收走，别盖在牌面上
+        // 截断一次，存 prefs 的和送去 parse 的都是同一份，口径一致
+        final boolean truncated = raw != null && raw.length() > MAGIC_MAX_CHARS;
+        final String text = (raw == null || !truncated) ? raw : raw.substring(0, MAGIC_MAX_CHARS);
+        if (text == null) {
+            prefs.edit().putBoolean("game_magic_on", false).remove("game_magic_text").apply();
+        } else {
+            prefs.edit().putBoolean("game_magic_on", true).putString("game_magic_text", text).apply();
+        }
+        final GameWords gw = gameWords;
+        if (gw == null) {
+            Toast.makeText(this, text == null ? "已退出，下次进游戏用词典出题"
+                    : "已保存，下次进游戏就用这套词", Toast.LENGTH_SHORT).show();
+            if (gameMagic != null) refreshMagicChip(-1);
+            return;
+        }
+        final ArrayList<String[]> rows = text == null ? new ArrayList<>() : WordImport.parse(text);
+        submitDb("magicImport", () -> {
+            // useImport / useDictionary 都要回查词典、重装个人词，全是 SQLite：放这条线上跑
+            final int n = text == null ? 0 : gw.useImport(rows);
+            if (text == null) gw.useDictionary();
+            runOnUiThread(() -> {
+                if (isFinishing()) return;
+                if (text == null) {
+                    Toast.makeText(this, "已换回词典出题", Toast.LENGTH_SHORT).show();
+                } else if (n <= 0) {
+                    // 一个都认不出来：开关记成"关"，否则下次进游戏又白解析一遍
+                    if (prefs != null) prefs.edit().putBoolean("game_magic_on", false).apply();
+                    Toast.makeText(this, "这些词一个都用不上：词典里查不到，"
+                            + "又没有写中文释义", Toast.LENGTH_LONG).show();
+                } else {
+                    int drop = rows.size() - n;
+                    Toast.makeText(this, "导入 " + n + " 个词"
+                            + (drop > 0 ? "（" + drop + " 个查不到释义，已跳过）" : "")
+                            + (truncated ? "（文本超过 " + MAGIC_MAX_CHARS + " 字，只用前面一段）" : ""),
+                            Toast.LENGTH_LONG).show();
+                }
+                if (gameView != null) gameView.reloadWave();    // 重铺一屏，分数不清
+                refreshGameTip();
+            });
+        });
     }
 
     /** 六级高频 + 中频都刷过一遍：让玩家决定重来还是往后走 */
@@ -2506,6 +2794,8 @@ public class MainActivity extends Activity {
 
     private void closeGame() {
         if (pageGame == null || pageGame.getVisibility() != View.VISIBLE) return;
+        // 页都关了，那次拍照借道就别再往回弹导入框了
+        magicFromOcr = false;
         if (gameView != null) {
             gameView.persistProgress();      // 先存档再关，下次进来接着玩
             gameView.stop();
@@ -2780,6 +3070,7 @@ public class MainActivity extends Activity {
             case StudyWrite.WRONG:   studyDb.wrong(j.word); break;
             case StudyWrite.FAV:     studyDb.favorite(j.word); break;
             case StudyWrite.UNFAV:   studyDb.unfavorite(j.word); break;
+            case StudyWrite.DELWRONG: studyDb.removeWrong(j.word); break;
             case StudyWrite.RESET:   studyDb.resetProgress(); break;
             default:                 studyDb.relearn(j.word); break;
         }
@@ -3079,6 +3370,7 @@ public class MainActivity extends Activity {
                                 final String title, final boolean canUnfav) {
         String body = (e == null || e.translation == null || e.translation.isEmpty())
                 ? "词典里没找到这个词" : e.translation.trim();
+        final boolean isWrongBook = "错题集".equals(title);
         AlertDialog.Builder b = new AlertDialog.Builder(this)
                 .setTitle(word)
                 .setMessage(body)
@@ -3089,6 +3381,12 @@ public class MainActivity extends Activity {
                 // 写库挪到 dbPool，落库完成后再刷新列表
                 queueStudyWrite(new StudyWrite(word, StudyWrite.UNFAV, this::renderWordBook));
                 Toast.makeText(this, "已取消收藏", Toast.LENGTH_SHORT).show();
+            });
+        } else if (isWrongBook) {
+            // 错题集能删词：只把「答错过」的记号抹掉，收藏和复习进度留着
+            b.setPositiveButton("删掉", (d, w) -> {
+                queueStudyWrite(new StudyWrite(word, StudyWrite.DELWRONG, this::renderWrongBook));
+                Toast.makeText(this, "已从错题集删掉", Toast.LENGTH_SHORT).show();
             });
         }
         b.show();
@@ -3172,7 +3470,45 @@ public class MainActivity extends Activity {
 
     // ================= 拍照翻译（系统相机 + ML Kit 离线文字识别） =================
 
+    /** 拍照请求码（权限回调用，和 100/101/102 那几个 Activity 结果码分开一套） */
+    private static final int REQ_STORAGE_PERM = 200;
+    private boolean pendingPhotoPerm;      // 权限批下来了就接着把相机拉起来
+
     private void takePhoto() {
+        // Android 9 及以下：往系统相册插一条记录要 WRITE_EXTERNAL_STORAGE，而且是**运行时**权限。
+        // manifest 里那条 maxSdkVersion="28" 只是"允许申请"，不申请就等于没有：
+        // getContentResolver().insert() 直接抛 SecurityException，被下面的 catch 吞成
+        // 一句"启动相机失败：..."，用户看到的就是"点拍照没反应"。
+        // Android 10 起分区存储，MediaStore 插入不再需要这个权限，别去多问一次。
+        if (Build.VERSION.SDK_INT <= 28
+                && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                != PackageManager.PERMISSION_GRANTED) {
+            pendingPhotoPerm = true;
+            requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE},
+                    REQ_STORAGE_PERM);
+            return;
+        }
+        startCamera();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int req, String[] perms, int[] grants) {
+        super.onRequestPermissionsResult(req, perms, grants);
+        if (req != REQ_STORAGE_PERM) return;
+        boolean granted = grants.length > 0 && grants[0] == PackageManager.PERMISSION_GRANTED;
+        boolean wanted = pendingPhotoPerm;
+        pendingPhotoPerm = false;
+        if (!granted) {
+            magicFromOcr = false;     // 权限没批，相机压根不会开，借道得先撤销
+            Toast.makeText(this, "没给存储权限，照片存不进相册。可以改用「从相册选图」，"
+                            + "或到系统设置里给「词桨」开启存储权限。",
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
+        if (wanted) startCamera();
+    }
+
+    private void startCamera() {
         try {
             ContentValues v = new ContentValues();
             v.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
@@ -3183,6 +3519,8 @@ public class MainActivity extends Activity {
             in.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
             startActivityForResult(in, 100);
         } catch (Throwable t) {
+            JLog.w("MainActivity.startCamera", t);
+            magicFromOcr = false;     // 相机没拉起来，神秘开关那次借道当场作废
             Toast.makeText(this, "启动相机失败：" + t.getMessage(), Toast.LENGTH_SHORT).show();
         }
     }
@@ -3221,20 +3559,46 @@ public class MainActivity extends Activity {
             }
             return;
         }
-        if (res != RESULT_OK) return;
+        if (res != RESULT_OK) {
+            magicFromOcr = false;    // 相机里按了返回：这次借道到此为止，别记在账上等一个不会来的结果
+            return;
+        }
         final Uri uri = req == 100 ? pendingPhotoUri : (data == null ? null : data.getData());
-        if (uri == null) return;
+        if (uri == null) {
+            magicFromOcr = false;
+            return;
+        }
         ocrText.setText("识别中…");
         submitDb("loadImage", () -> {
             final Bitmap bmp;
             try {
                 bmp = loadBitmap(uri);
             } catch (Throwable t) {
-                runOnUiThread(() -> ocrText.setText("图片读取失败：" + t.getMessage()));
+                runOnUiThread(() -> ocrFail("图片读取失败：" + t.getMessage()));
                 return;
             }
-            runOnUiThread(() -> showCrop(bmp));   // 先让用户框选，再识别
+            runOnUiThread(() -> {
+                if (magicFromOcr) {
+                    // 神秘开关要的是"一整页词表"，不是"框一行"：跳过框选，整张直接识。
+                    // 图的所属权交给 runOcr（它负责回收），拍照页那套流程原样没动。
+                    runOcr(bmp);
+                    return;
+                }
+                showCrop(bmp);   // 先让用户框选，再识别
+            });
         });
+    }
+
+    /**
+     * 识别出岔子。正常路径只是把话写在拍照页那个框里；
+     * 神秘开关借道时用户根本看不见那个框（他在游戏页上），所以要当场说出来，并结束借道。
+     */
+    private void ocrFail(String msg) {
+        if (ocrText != null) ocrText.setText(msg);
+        if (magicFromOcr) {
+            magicFromOcr = false;
+            Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
+        }
     }
 
     /** 拍照/选图后先进入框选：拖框决定识别哪一块，避免整页无关文字混进来 */
@@ -3389,7 +3753,7 @@ public class MainActivity extends Activity {
                 img = upscaleForOcr(bmp);
             } catch (Throwable t) {
                 recycleOcrPair(bmp, null);
-                runOnUiThread(() -> ocrText.setText("图片预处理失败：" + t.getMessage()));
+                runOnUiThread(() -> ocrFail("图片预处理失败：" + t.getMessage()));
                 return;
             }
             final List<com.google.android.gms.tasks.Task<Text>> tasks = new ArrayList<>();
@@ -3406,7 +3770,7 @@ public class MainActivity extends Activity {
              }
             if (tasks.isEmpty()) {
                 recycleOcrPair(bmp, img);
-                runOnUiThread(() -> ocrText.setText("识别服务未就绪，请重启 App 再试"));
+                runOnUiThread(() -> ocrFail("识别服务未就绪，请重启 App 再试"));
                 return;
             }
             // 完成回调也走同一道门：直接写 dbPool 的话，线程池收摊那一刻
@@ -3437,7 +3801,7 @@ public class MainActivity extends Activity {
                             }
                             if (msg.toString().trim().isEmpty()) msg.append("识别服务未就绪");
                             final String m = msg.toString();
-                            runOnUiThread(() -> ocrText.setText("文字识别失败：" + m));
+                            runOnUiThread(() -> ocrFail("文字识别失败：" + m));
                             return;
                         }
                         // 后处理永远不许把识别结果吞掉：处理后为空就退回原始输出
@@ -3450,8 +3814,23 @@ public class MainActivity extends Activity {
                         final int conf = (int) Math.max(0, Math.min(99, bestScore));
                         final String result = text;
                         runOnUiThread(() -> {
+                            if (magicFromOcr) {
+                                // 神秘开关借的这一次：字不进拍照页，直接灌回导入框接着编辑
+                                magicFromOcr = false;
+                                if (result.isEmpty()) {
+                                    Toast.makeText(this, "照片里没认出文字，还是手写或粘贴吧",
+                                            Toast.LENGTH_SHORT).show();
+                                } else if (isPageVisible(pageGame)) {
+                                    showMagicDialog(magicDraft.trim().isEmpty()
+                                            ? result : magicDraft.trim() + "\n" + result);
+                                    Toast.makeText(this, "识别好了，认不出的行会自动跳过",
+                                            Toast.LENGTH_SHORT).show();
+                                }
+                                if (!result.isEmpty() && ocrText != null) ocrText.setText(result);
+                                return;
+                            }
                             if (result.isEmpty()) {
-                                ocrText.setText("未识别到文字，请保证字迹清晰、光线充足后重试");
+                                ocrFail("未识别到文字，请保证字迹清晰、光线充足后重试");
                             } else {
                                 ocrText.setText(result);
                                 Toast.makeText(this, model + " · 置信度 " + conf + "% · v"
@@ -3780,9 +4159,9 @@ public class MainActivity extends Activity {
                 resetTranslators();
                 translateOutput.setText("引擎响应超时（30 秒）。\n\n可能原因与对策：\n"
                         + "1) 首次使用需联网下载语言包，请确认网络可用后重试；\n"
-                        + "2) 手机管家/安全软件可能拦截了语言包下载，请放行简译；\n"
+                        + "2) 手机管家/安全软件可能拦截了语言包下载，请放行词桨；\n"
                         + "3) 切换 Wi-Fi/流量后再试；\n"
-                        + "4) 仍不行：设置 → 应用 → 简译 → 清除数据，重启 App（词典会自动重新解压）。");
+                        + "4) 仍不行：设置 → 应用 → 词桨 → 清除数据，重启 App（词典会自动重新解压）。");
             }
         };
         // 挂在字段 handler 上：成功/失败/onDestroy 都要撤掉，
@@ -3862,24 +4241,55 @@ public class MainActivity extends Activity {
         tip.setPadding(0, dp(8), 0, 0);
         credBox.addView(etId);
         credBox.addView(etKey);
+        // 显示/隐藏开关：一枚小圆点。密钥这种东西明晃晃摆在屏幕上，
+        // 截图、录屏、肩上有人瞄一眼都不该顺手带出去；想核对填对没有，点一下临时露一眼。
+        final TextView eye = new TextView(this);
+        eye.setTextSize(16);
+        eye.setPadding(0, dp(6), 0, 0);
+        eye.setContentDescription("显示凭据");
+        credBox.addView(eye);
         credBox.addView(tip);
+
+        // 遮住 / 露出来。用 InputType + TransformationMethod 两件事一起改：
+        // 只改其中一个，键盘类型或显示方式会对不上（露出来还是一串圆点）。
+        final boolean[] revealed = {false};
+        final Runnable[] applyMask = new Runnable[1];
+        applyMask[0] = () -> {
+            boolean hide = !revealed[0];
+            for (EditText et : new EditText[]{etId, etKey}) {
+                et.setInputType(hide
+                        ? InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD
+                        : InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
+                et.setTransformationMethod(hide ? PasswordTransformationMethod.getInstance() : null);
+                // setInputType 会把光标甩到末尾，手动拉回去，不然改完得从头再点一遍
+                if (et.getText() != null) et.setSelection(et.getText().length());
+            }
+            eye.setText(revealed[0] ? "◉" : "○");
+            eye.setContentDescription(revealed[0] ? "隐藏凭据" : "显示凭据");
+            eye.setTextColor(getColor(revealed[0] ? R.color.accent : R.color.text_secondary));
+        };
+        applyMask[0].run();
+        eye.setOnClickListener(v -> {
+            revealed[0] = !revealed[0];
+            applyMask[0].run();
+        });
 
         final Runnable[] fill = new Runnable[1];
         fill[0] = () -> {
             String prov = prefs.getString(CloudTrans.PREF_PROVIDER, CloudTrans.PROVIDER_BAIDU);
             if (CloudTrans.PROVIDER_TENCENT.equals(prov)) {
                 etId.setHint("SecretId");
-                etId.setText(prefs.getString("tencent_secret_id", ""));
+                etId.setText(SecretStore.get(prefs, "tencent_secret_id"));
                 etKey.setHint("SecretKey");
-                etKey.setText(prefs.getString("tencent_secret_key", ""));
+                etKey.setText(SecretStore.get(prefs, "tencent_secret_key"));
                 tip.setText("腾讯云机器翻译：控制台 → 访问管理 → API 密钥管理，新建一个密钥，"
                         + "把 SecretId / SecretKey 填进来。需先开通「机器翻译」服务。"
                         + "免费额度约每月 500 万字符，国内直连稳定。");
             } else {
                 etId.setHint("APP ID");
-                etId.setText(prefs.getString("baidu_appid", ""));
+                etId.setText(SecretStore.get(prefs, "baidu_appid"));
                 etKey.setHint("密钥");
-                etKey.setText(prefs.getString("baidu_secret", ""));
+                etKey.setText(SecretStore.get(prefs, "baidu_secret"));
                 tip.setText("免费获取：fanyi-api.baidu.com → 注册 → 开通「通用翻译」。"
                         + "填入后联网翻译走云端（更通顺），断网自动切回离线引擎；每月免费额度约 5 万字符。");
             }
@@ -3919,11 +4329,11 @@ public class MainActivity extends Activity {
                     final String id = etId.getText().toString().trim();
                     final String key = etKey.getText().toString().trim();
                     if (CloudTrans.PROVIDER_TENCENT.equals(prov)) {
-                        prefs.edit().putString("tencent_secret_id", id)
-                                .putString("tencent_secret_key", key).apply();
+                        SecretStore.put(prefs, "tencent_secret_id", id);
+                        SecretStore.put(prefs, "tencent_secret_key", key);
                     } else {
-                        prefs.edit().putString("baidu_appid", id)
-                                .putString("baidu_secret", key).apply();
+                        SecretStore.put(prefs, "baidu_appid", id);
+                        SecretStore.put(prefs, "baidu_secret", key);
                     }
                     refreshCloudLabel();
                     if (id.isEmpty() || key.isEmpty()) {
@@ -3947,9 +4357,11 @@ public class MainActivity extends Activity {
                     // 只停用当前厂商的凭据，另一家留着
                     String prov = prefs.getString(CloudTrans.PREF_PROVIDER, CloudTrans.PROVIDER_BAIDU);
                     if (CloudTrans.PROVIDER_TENCENT.equals(prov)) {
-                        prefs.edit().remove("tencent_secret_id").remove("tencent_secret_key").apply();
+                        SecretStore.remove(prefs, "tencent_secret_id");
+                        SecretStore.remove(prefs, "tencent_secret_key");
                     } else {
-                        prefs.edit().remove("baidu_appid").remove("baidu_secret").apply();
+                        SecretStore.remove(prefs, "baidu_appid");
+                        SecretStore.remove(prefs, "baidu_secret");
                     }
                     refreshCloudLabel();
                 })
@@ -4901,8 +5313,10 @@ public class MainActivity extends Activity {
                 deletePack();
                 Toast.makeText(this, "素材包已删除，只保留内置的", Toast.LENGTH_SHORT).show();
             } else if (!hasPack && countMissingMaterial() == 0) {
-                // 内置就齐了：手动点一下等于「立刻查一次目录」，绕过一小时的节流
-                prefs.edit().putLong("manifest_refresh_ts", 0).commit();
+                // 内置就齐了：手动点一下等于「立刻查一次目录」，绕过一小时的节流。
+                // apply() 就够：内存里那份立刻生效，后面 refreshManifests() 读到的就是 0；
+                // 这个时间戳只是节流用，掉进程丢了也无所谓，不值得为它同步等一次磁盘。
+                prefs.edit().putLong("manifest_refresh_ts", 0).apply();
                 Toast.makeText(this, "正在检查有没有新素材…", Toast.LENGTH_SHORT).show();
                 refreshManifests();
                 return;

@@ -1,5 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Android 11 及以下的自动备份规则：同样只排除密钥所在的 shared_prefs。 -->
+<!-- Android 11 及以下的自动备份规则。
+     domain 合法值：file / database / sharedpref / external / root
+     （之前写的 shared_prefs 不合法，已改正）。
+     密钥所在 sharedpref 整域排除；词典本体 dict.db（约 56MB）单独排除，
+     学习进度 study.db 和查询历史 history.db 继续备份。 -->
 <full-backup-content>
-    <exclude domain="shared_prefs" />
+    <exclude domain="sharedpref" />
+    <exclude domain="file" path="dict.db" />
 </full-backup-content>

@@ -187,7 +187,7 @@ def main():
 
     manifest["version"] = 2
     manifest["updated"] = "2026-10-20"
-    manifest["note"] = ("简译 App 阅读素材清单。builtin=true 的已内置在 APK，"
+    manifest["note"] = ("词桨 App 阅读素材清单。builtin=true 的已内置在 APK，"
                         "其余由「素材包」开关联网下载到手机。NASA 文章为美国政府作品（公共域）。")
     open(MANIFEST_REPO, "w", encoding="utf-8").write(
         json.dumps(manifest, ensure_ascii=False, indent=2))

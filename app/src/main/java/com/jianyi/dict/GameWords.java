@@ -1,6 +1,7 @@
 package com.jianyi.dict;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -42,6 +43,24 @@ public class GameWords {
     private final ArrayList<MatchGameView.Pair> queue = new ArrayList<>();
     /** 上次退出时没消完的牌，接着用（恢复进度用） */
     private final ArrayList<MatchGameView.Pair> resume = new ArrayList<>();
+
+    /**
+     * 神秘开关：玩家自己导入的词（v3.15.1）。
+     * 非空 = 只出这些词，词典那套词频顺序原样停在原地不动，关掉开关就接着往下走。
+     */
+    private final ArrayList<MatchGameView.Pair> custom = new ArrayList<>();
+    /** 导入表的发牌堆：洗完一轮再洗下一轮，这样一屏之内不会重样 */
+    private final ArrayList<MatchGameView.Pair> customDeck = new ArrayList<>();
+
+    /**
+     * isCustom() / customCount() 的无锁快照（v3.16.1 修）。
+     * custom 是普通 ArrayList，界面线程直接读它，可能正好撞上 dbPool 上
+     * useImport 的 addAll 进行到一半——读到半个数（比如 ✦ 后显示 137/300），
+     * 虽不会崩但 UI 会抖一下。改成：锁内改完 custom，再把这两个 volatile
+     * 翻过来；界面线程只读 volatile，既不等锁、也不会读到中间态。
+     */
+    private volatile boolean customOn;
+    private volatile int customCountSnap;
 
     private final ArrayList<String> page = new ArrayList<>();
     private int pageIdx;
@@ -94,7 +113,9 @@ public class GameWords {
                     if (row.length > 2) lv = Integer.parseInt(row[2]);
                 } catch (NumberFormatException ignore) { JLog.w("GameWords.restore", ignore);
                  }
-                resume.add(new MatchGameView.Pair(w, zh, lv));
+                MatchGameView.Pair p = new MatchGameView.Pair(w, zh, lv);
+                markUsed(p);            // 没消完的牌也登记，见 takeDueWrong 同款说明
+                resume.add(p);
             }
         } catch (Throwable ignored) { JLog.w("GameWords.restore", ignored);
          }
@@ -103,6 +124,7 @@ public class GameWords {
     /** 退出游戏 / 切后台：把词序游标和没消完的牌存下来 */
     public synchronized void saveProgress(List<MatchGameView.Pair> onScreen) {
         if (study == null) return;
+        if (!custom.isEmpty()) return;      // 自定义牌面不写存档，免得混进词典那一局
         try {
             study.setGameState("stage", stage);
             study.setGameState("offset", offset);
@@ -143,6 +165,8 @@ public class GameWords {
     public synchronized ArrayList<MatchGameView.Pair> take(int want) {
         ArrayList<MatchGameView.Pair> out = new ArrayList<>();
         if (want <= 0 || dict == null) return out;
+        // 神秘开关开着：整条词典管线（回炉错词 / 单词本 / 词频档）都不掺进来
+        if (!custom.isEmpty()) return takeCustom(want);
         // 先把上次没消完的牌接上，再插个人词，最后才按词频取新词
         while (!resume.isEmpty() && out.size() < want) out.add(resume.remove(0));
         if (!personal.isEmpty() && out.size() < want) out.add(personal.remove(0));
@@ -155,6 +179,125 @@ public class GameWords {
             if (!fillOne()) break;
         }
         return out;
+    }
+
+    // ================= 神秘开关：导入词出题（v3.15.1）=================
+
+    /**
+     * 换成玩家自己导入的词表出题。
+     * rows 是 WordImport 解析出来的 {词, 释义}，释义为空就用词典里的第一个义项；
+     * 词典也查不到、又没给释义的词收不进来（配对游戏没中文可配）。
+     *
+     * @return 真正能上牌的词数
+     */
+    public synchronized int useImport(ArrayList<String[]> rows) {
+        ArrayList<MatchGameView.Pair> built = new ArrayList<>();
+        customDeck.clear();
+        if (rows != null) {
+            HashSet<String> seen = new HashSet<>();
+            HashSet<String> seenZh = new HashSet<>();
+            for (String[] r : rows) {
+                if (built.size() >= WordImport.MAX_WORDS) break;
+                if (r == null || r.length < 1) continue;
+                String w = r[0] == null ? "" : r[0].trim().toLowerCase(Locale.US);
+                if (w.isEmpty() || w.length() > 30 || !seen.add(w)) continue;
+                String zh = r.length > 1 && r[1] != null ? r[1].trim() : "";
+                DictDb.Entry e = lookupOrNull(w);
+                if (zh.isEmpty()) {
+                    zh = firstMeaning(e);
+                    if (zh.isEmpty()) continue;         // 哪儿都查不到：这块牌出不了
+                }
+                // 释义只留第一个义项，和 WordImport 同一口径：整条「放弃, 遗弃, 抛弃」装不下，
+                // 而下面那道硬截断更危险——两条长释义会截成同一个前缀，屏幕上就是两块一模一样的牌。
+                zh = WordImport.firstClause(zh);
+                if (zh.length() > 16) zh = zh.substring(0, 16);
+                // 中文也要去重：WordImport 只管贴进来的那些字，词典补的释义不归它管，
+                // 而 abandon（贴的「放弃」）和 desert（查词典也是「放弃」）撞在一起，
+                // 同一屏就会出现两张「放弃」——玩家没法配，看着就像出题重复了。
+                if (zh.isEmpty() || !seenZh.add(zh)) continue;
+                built.add(new MatchGameView.Pair(w, zh, levelOf(e)));
+            }
+        }
+        if (built.isEmpty()) return 0;      // 一个都用不上：原来的牌面、存档一概不动
+        custom.clear();
+        custom.addAll(built);
+        customOn = true;                    // 锁内改完再翻快照，界面线程读到的永远是整数
+        customCountSnap = custom.size();
+        queue.clear();
+        resume.clear();
+        // 导入模式不写牌面存档（见 saveProgress）：现在把残留清掉，
+        // 切回正常词库时才不会把自定义词当成"上次没消完的牌"再铺一次。
+        if (study != null) {
+            try {
+                study.saveGamePending(new ArrayList<String[]>());
+            } catch (Throwable ignored) { JLog.w("GameWords.useImport", ignored);
+             }
+        }
+        return custom.size();
+    }
+
+    /** 关掉神秘开关：回到词典出词，词序游标还在原位，接着上次往下出 */
+    public synchronized void useDictionary() {
+        custom.clear();
+        customDeck.clear();
+        customOn = false;
+        customCountSnap = 0;
+        queue.clear();
+        resume.clear();
+        personal.clear();
+        loadPersonal();         // 「已出过」的登记没清，所以这里不会把出过的词再塞回来
+    }
+
+    /**
+     * 现在是不是自定义词表出题。
+     * 读的是 volatile 快照，不加锁：界面线程只读一个 boolean 判断，别为了这行代码去等 dbPool 上的 useImport。
+     */
+    public boolean isCustom() {
+        return customOn;
+    }
+
+    /** 导入了多少个词（顶部小字用；同上，读 volatile 快照，不抢锁） */
+    public int customCount() {
+        return customCountSnap;
+    }
+
+    /**
+     * 导入词的发牌：洗完一轮再洗下一轮，所以自定义模式不会"出完"。
+     * 词堆不够铺满一屏（导入不足 5 对）时会把刚洗完的一轮接着摊开，
+     * 但同一屏里绝不重复——同一屏出现两张一模一样的中文，玩家根本没法配，
+     * 看着就像"出题重复了两组"（v3.15.1 反馈的那个）。
+     */
+    private ArrayList<MatchGameView.Pair> takeCustom(int want) {
+        ArrayList<MatchGameView.Pair> out = new ArrayList<>();
+        HashSet<String> thisWaveEn = new HashSet<>();
+        HashSet<String> thisWaveZh = new HashSet<>();
+        for (int spin = 0; out.size() < want && spin < 8; spin++) {
+            while (out.size() < want && !customDeck.isEmpty()) {
+                MatchGameView.Pair p = customDeck.remove(customDeck.size() - 1);
+                if (p == null || p.en == null) continue;
+                String en = p.en.trim().toLowerCase(Locale.US);
+                String zh = p.zh == null ? "" : p.zh.trim();
+                if (!thisWaveEn.add(en)) continue;
+                if (!zh.isEmpty() && !thisWaveZh.add(zh)) continue;
+                out.add(p);
+            }
+            if (out.size() < want && !custom.isEmpty()) {
+                customDeck.addAll(custom);
+                Collections.shuffle(customDeck);
+            } else if (custom.isEmpty()) {
+                break;
+            }
+        }
+        return out;
+    }
+
+    /** 词典里的第一个义项；和 makePair 同一套清洗，剥不干净就当没有 */
+    private String firstMeaning(DictDb.Entry e) {
+        if (e == null || e.translation == null) return "";
+        ArrayList<String> ms = Quiz.meanings(e.translation, 10);
+        if (ms.isEmpty()) return "";
+        String zh = ms.get(0).replace("\n", " ").trim();
+        return zh.matches(".*[A-Za-z].*") ? "" : zh;   // 半截英文的义项拿来配对等于出错题
     }
 
     /** 组一对进队列；取不到新词了返回 false */
@@ -211,6 +354,28 @@ public class GameWords {
         return false;
     }
 
+    /** 词典查一次，查不到 / 没就绪就返回 null（调用方都在 dbPool 上，不用另开线程） */
+    private DictDb.Entry lookupOrNull(String w) {
+        if (dict == null || w == null) return null;
+        try {
+            return dict.lookup(w.trim().toLowerCase(Locale.US));
+        } catch (Throwable t) {
+            JLog.w("GameWords.lookupOrNull", t);
+            return null;
+        }
+    }
+
+    /**
+     * 登记"这组词已经在牌面上了"。
+     * 回炉错词和上次没消完的牌都不走 makePair，不登记的话 usedEn/usedZh 不知道它们存在，
+     * 同一屏里同一个词就会被再抽一次 —— 就是"两组一模一样的词"那个 bug（石英/quartz 重复）。
+     */
+    private void markUsed(MatchGameView.Pair p) {
+        if (p == null) return;
+        if (p.en != null) usedEn.add(p.en.trim().toLowerCase(Locale.US));
+        if (p.zh != null) usedZh.add(p.zh.trim());
+    }
+
     /** 单词 → 可出题的词对；中文太长/太碎/重复的都不要 */
     private MatchGameView.Pair makePair(String w) {
         if (w == null) return null;
@@ -251,6 +416,7 @@ public class GameWords {
      * 错在第 N 屏 → 第 N+1 / N+2 / N+3 屏都取不到 → 第 N+4 屏出现（中间正好 15 对）。
      */
     public synchronized ArrayList<MatchGameView.Pair> onWaveStart(int max) {
+        if (!custom.isEmpty()) return new ArrayList<>();   // 自定义模式：不掺回炉词，也不扣倒计时
         ArrayList<MatchGameView.Pair> out = takeDueWrong(max);
         if (study != null) {
             try {
@@ -265,13 +431,19 @@ public class GameWords {
     public synchronized ArrayList<MatchGameView.Pair> takeDueWrong(int max) {
         ArrayList<MatchGameView.Pair> out = new ArrayList<>();
         if (study == null) return out;
+        if (!custom.isEmpty()) return out;      // 自定义模式：牌面只放玩家导入的词
         try {
             for (String[] row : study.dueGameWrong(max)) {
                 String w = row[0];
                 String zh = row[1] == null ? "" : row[1].trim();
                 study.removeGameWrong(w);
                 if (w == null || w.isEmpty() || zh.isEmpty()) continue;
-                out.add(new MatchGameView.Pair(w, zh));
+                MatchGameView.Pair p = new MatchGameView.Pair(w, zh, levelOf(lookupOrNull(w)));
+                // 回炉词也要登记，否则同一屏里 makePair 会把这个词当新词再抽一次
+                // —— 就是"两组一模一样的词"（截图里 quartz/石英 各两块，带红条的是新抽的，
+                //    不带条的是回炉的：存档只存词形，词级得回查一次词典才补得回来）。
+                markUsed(p);
+                out.add(p);
             }
         } catch (Throwable ignored) { JLog.w("GameWords.takeDueWrong", ignored);
          }
@@ -292,6 +464,13 @@ public class GameWords {
     public synchronized void rememberWrong(MatchGameView.Pair p) {
         if (study == null || p == null) return;
         try {
+            if (!custom.isEmpty()) {
+                // 自定义模式：只有词典里真有的词才进错题集。
+                // 玩家手输的词（词典查不到）进了错题集就是「点了看不到释义」那个老 bug 的翻版，
+                // 回炉存档也一律不写——那套倒计时是给词典那一局排的。
+                if (lookupOrNull(p.en) != null) study.wrong(p.en);
+                return;
+            }
             // 先记进「错题集」再管游戏回炉存档（#4）：
             // study.wrong() 会把 fav.wrong 计数 +1，于是这个词会出现在查词页的「错题集」
             // 里、并按 Leitner 盒子参与日常复习。放在存档容量判断之外，
@@ -311,7 +490,7 @@ public class GameWords {
 
     /** 里程碑只报一次 */
     public boolean consumeMilestone() {
-        if (!milestoneSent && highMidDone()) {
+        if (!milestoneSent && !isCustom() && highMidDone()) {
             milestoneSent = true;
             return true;
         }

@@ -1,13 +1,24 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Android 12+ 的备份/传输规则。
-     云端翻译的百度 AppSecret、腾讯云 SecretKey 存在 shared_prefs 里，
-     明文落盘；不排除就会随云备份和换机迁移流出设备。
-     学习进度在 databases，照常备份。 -->
+
+     domain 的合法取值只有官方那套：file / database / sharedpref / external / root。
+     之前这里写的是 shared_prefs —— 不是合法值，整条排除等于没生效，
+     现在改成 sharedpref。
+
+     云端翻译的百度 AppSecret、腾讯云 SecretKey 存在 sharedpref 里
+     （Keystore 加密后的密文），整域排除：换机时密钥本来也解不开，
+     带过去只是垃圾数据。
+
+     files/dict.db 是随包解压出来的词典本体（约 56MB），新机会重新解压一遍，
+     备份它纯属白占配额，所以单独排掉；
+     学习进度 study.db、查询历史 history.db 照常备份，换机能带走。 -->
 <data-extraction-rules>
     <cloud-backup>
-        <exclude domain="shared_prefs" />
+        <exclude domain="sharedpref" />
+        <exclude domain="file" path="dict.db" />
     </cloud-backup>
     <device-transfer>
-        <exclude domain="shared_prefs" />
+        <exclude domain="sharedpref" />
+        <exclude domain="file" path="dict.db" />
     </device-transfer>
 </data-extraction-rules>
